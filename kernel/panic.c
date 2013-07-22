@@ -24,6 +24,7 @@
 #include <linux/nmi.h>
 #include <linux/dmi.h>
 #include <linux/coresight.h>
+#include <linux/console.h>
 
 #define PANIC_TIMER_STEP 100
 #define PANIC_BLINK_SPD 18
@@ -135,6 +136,9 @@ void panic(const char *fmt, ...)
 	/* print last_kmsg even after console suspend */
 	if (is_console_suspended())
 		resume_console();
+
+	if (is_console_locked())
+		console_unlock();
 
 	if (is_console_locked())
 		console_unlock();
