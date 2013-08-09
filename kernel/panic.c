@@ -140,6 +140,10 @@ void panic(const char *fmt, ...)
 	if (is_console_locked())
 		console_unlock();
 
+	/* print last_kmsg even after console suspend */
+	if (is_console_suspended())
+		resume_console();
+
 	if (is_console_locked())
 		console_unlock();
 
