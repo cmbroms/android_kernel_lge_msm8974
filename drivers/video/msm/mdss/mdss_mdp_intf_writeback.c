@@ -13,9 +13,9 @@
 
 #define pr_fmt(fmt)	"%s: " fmt, __func__
 
-#include "mdss_fb.h"
 #include "mdss_mdp.h"
 #include "mdss_mdp_rotator.h"
+#include "mdss_panel.h"
 
 enum mdss_mdp_writeback_type {
 	MDSS_MDP_WRITEBACK_TYPE_ROTATOR,
@@ -205,6 +205,7 @@ static int mdss_mdp_writeback_format_setup(struct mdss_mdp_writeback_ctx *ctx,
 	mdp_wb_write(ctx, MDSS_MDP_REG_WB_DST_YSTRIDE0, ystride0);
 	mdp_wb_write(ctx, MDSS_MDP_REG_WB_DST_YSTRIDE1, ystride1);
 	mdp_wb_write(ctx, MDSS_MDP_REG_WB_OUT_SIZE, outsize);
+	mdp_wb_write(ctx, MDSS_MDP_REG_WB_DST_WRITE_CONFIG, 0x58);
 
 	return 0;
 }
@@ -218,7 +219,7 @@ static int mdss_mdp_writeback_prepare_wfd(struct mdss_mdp_ctl *ctl, void *arg)
 	if (!ctx)
 		return -ENODEV;
 
-	if (ctx->initialized) /* already set */
+	if (ctx->initialized && !ctl->shared_lock) /* already set */
 		return 0;
 
 	pr_debug("wfd setup ctl=%d\n", ctl->num);
@@ -247,6 +248,7 @@ static int mdss_mdp_writeback_prepare_rot(struct mdss_mdp_ctl *ctl, void *arg)
 	struct mdss_mdp_writeback_ctx *ctx;
 	struct mdss_mdp_writeback_arg *wb_args;
 	struct mdss_mdp_rotator_session *rot;
+	struct mdss_data_type *mdata;
 	u32 format;
 
 	ctx = (struct mdss_mdp_writeback_ctx *) ctl->priv_data;
@@ -259,6 +261,11 @@ static int mdss_mdp_writeback_prepare_rot(struct mdss_mdp_ctl *ctl, void *arg)
 	rot = (struct mdss_mdp_rotator_session *) wb_args->priv_data;
 	if (!rot) {
 		pr_err("unable to retrieve rot session ctl=%d\n", ctl->num);
+		return -ENODEV;
+	}
+	mdata = ctl->mdata;
+	if (!mdata) {
+		pr_err("no mdata attached to ctl=%d", ctl->num);
 		return -ENODEV;
 	}
 	pr_debug("rot setup wb_num=%d\n", ctx->wb_num);
@@ -279,7 +286,8 @@ static int mdss_mdp_writeback_prepare_rot(struct mdss_mdp_ctl *ctl, void *arg)
 
 	ctx->rot90 = !!(rot->flags & MDP_ROT_90);
 
-	if (ctx->bwc_mode || ctx->rot90)
+	if (ctx->bwc_mode || (ctx->rot90 &&
+			     (mdata->mdp_rev < MDSS_MDP_HW_REV_102)))
 		format = mdss_mdp_get_rotator_dst_format(rot->format);
 	else
 		format = rot->format;
@@ -344,13 +352,18 @@ static int mdss_mdp_wb_wait4comp(struct mdss_mdp_ctl *ctl, void *arg)
 	if (ctx->comp_cnt == 0)
 		return rc;
 
-	rc = wait_for_completion_interruptible_timeout(&ctx->wb_comp,
+	rc = wait_for_completion_timeout(&ctx->wb_comp,
 			KOFF_TIMEOUT);
-	if (rc <= 0) {
+	mdss_mdp_set_intr_callback(ctx->intr_type, ctx->intf_num,
+		NULL, NULL);
+
+	if (rc == 0) {
+		mdss_mdp_ctl_notify(ctl, MDP_NOTIFY_FRAME_TIMEOUT);
 		rc = -ENODEV;
 		WARN(1, "writeback kickoff timed out (%d) ctl=%d\n",
 						rc, ctl->num);
 	} else {
+		mdss_mdp_ctl_notify(ctl, MDP_NOTIFY_FRAME_DONE);
 		rc = 0;
 	}
 
@@ -387,6 +400,9 @@ static int mdss_mdp_writeback_display(struct mdss_mdp_ctl *ctl, void *arg)
 		pr_err("writeback data setup error ctl=%d\n", ctl->num);
 		return ret;
 	}
+
+	mdss_mdp_set_intr_callback(ctx->intr_type, ctx->intf_num,
+		   mdss_mdp_writeback_intr_done, ctx);
 
 	ctx->callback_fnc = wb_args->callback_fnc;
 	ctx->callback_arg = wb_args->priv_data;
@@ -433,9 +449,6 @@ int mdss_mdp_writeback_start(struct mdss_mdp_ctl *ctl)
 	ctx->initialized = false;
 	init_completion(&ctx->wb_comp);
 
-	mdss_mdp_set_intr_callback(ctx->intr_type, ctx->intf_num,
-				   mdss_mdp_writeback_intr_done, ctx);
-
 	if (ctx->type == MDSS_MDP_WRITEBACK_TYPE_ROTATOR)
 		ctl->prepare_fnc = mdss_mdp_writeback_prepare_rot;
 	else /* wfd or line mode */
@@ -445,4 +458,22 @@ int mdss_mdp_writeback_start(struct mdss_mdp_ctl *ctl)
 	ctl->wait_fnc = mdss_mdp_wb_wait4comp;
 
 	return ret;
+}
+
+int mdss_mdp_writeback_display_commit(struct mdss_mdp_ctl *ctl, void *arg)
+{
+	if (ctl->shared_lock && !mutex_is_locked(ctl->shared_lock)) {
+		pr_err("shared mutex is not locked before commit on ctl=%d\n",
+			ctl->num);
+		return -EINVAL;
+	}
+
+	if (ctl->mdata->mixer_switched) {
+		if (ctl->mixer_left)
+			ctl->mixer_left->params_changed++;
+		if (ctl->mixer_right)
+			ctl->mixer_right->params_changed++;
+	}
+
+	return mdss_mdp_display_commit(ctl, arg);
 }
