@@ -71,6 +71,20 @@ static bool is_turbo_requested(struct msm_vidc_core *core,
 	return false;
 }
 
+static bool is_thumbnail_session(struct msm_vidc_inst *inst)
+{
+	if (inst->session_type == MSM_VIDC_DECODER) {
+		int rc = 0;
+		struct v4l2_control ctrl = {
+			.id = V4L2_CID_MPEG_VIDC_VIDEO_SYNC_FRAME_DECODE
+		};
+		rc = v4l2_g_ctrl(&inst->ctrl_handler, &ctrl);
+		if (!rc && ctrl.value)
+			return true;
+	}
+	return false;
+}
+
 static int msm_comm_get_load(struct msm_vidc_core *core,
 	enum session_type type)
 {
@@ -85,30 +99,10 @@ static int msm_comm_get_load(struct msm_vidc_core *core,
 		if (inst->session_type == type &&
 			inst->state >= MSM_VIDC_OPEN_DONE &&
 			inst->state < MSM_VIDC_STOP_DONE) {
-			int stride, scanlines, rc;
-			struct hfi_device *hdev;
-
-			hdev = inst->core->device;
-			if (!hdev) {
-				dprintk(VIDC_ERR,
-						"No hdev (probably in bad state)\n");
-				mutex_unlock(&inst->lock);
-				return -EINVAL;
-			}
-
-			rc = call_hfi_op(hdev, get_stride_scanline,
-					COLOR_FMT_NV12,
-					inst->prop.width, inst->prop.height,
-					&stride, &scanlines);
-			if (rc) {
-				dprintk(VIDC_WARN,
-						"Failed to determine stride/scan when getting load. Perf. might be affected\n");
-				stride = inst->prop.width;
-				scanlines = inst->prop.height;
-			}
-
-			num_mbs_per_sec += NUM_MBS_PER_SEC(stride, scanlines,
-					inst->prop.fps);
+			if (!is_thumbnail_session(inst))
+				num_mbs_per_sec += NUM_MBS_PER_SEC(
+					inst->prop.height,
+					inst->prop.width, inst->prop.fps);
 		}
 		mutex_unlock(&inst->lock);
 	}
@@ -1567,6 +1561,25 @@ exit:
 	return rc;
 }
 
+static void msm_vidc_print_running_insts(struct msm_vidc_core *core)
+{
+	struct msm_vidc_inst *temp;
+	dprintk(VIDC_ERR, "Running instances:\n");
+	dprintk(VIDC_ERR, "%4s|%4s|%4s|%4s\n", "type", "w", "h", "fps");
+	list_for_each_entry(temp, &core->instances, list) {
+		mutex_lock(&temp->lock);
+		if (temp->state >= MSM_VIDC_OPEN_DONE &&
+				temp->state < MSM_VIDC_STOP_DONE) {
+			dprintk(VIDC_ERR, "%4d|%4d|%4d|%4d\n",
+					temp->session_type,
+					temp->prop.width,
+					temp->prop.height,
+					temp->prop.fps);
+		}
+		mutex_unlock(&temp->lock);
+	}
+}
+
 static int msm_vidc_load_resources(int flipped_state,
 	struct msm_vidc_inst *inst)
 {
@@ -1590,24 +1603,9 @@ static int msm_vidc_load_resources(int flipped_state,
 	num_mbs_per_sec = msm_comm_get_load(inst->core, MSM_VIDC_DECODER);
 	num_mbs_per_sec += msm_comm_get_load(inst->core, MSM_VIDC_ENCODER);
 	if (num_mbs_per_sec > inst->core->resources.max_load) {
-		struct msm_vidc_inst *temp;
-
 		dprintk(VIDC_ERR, "HW is overloaded, needed: %d max: %d\n",
 			num_mbs_per_sec, inst->core->resources.max_load);
-		dprintk(VIDC_ERR, "Running instances:\n");
-		dprintk(VIDC_ERR, "%4s|%4s|%4s|%4s\n", "type", "w", "h", "fps");
-		list_for_each_entry(temp, &inst->core->instances, list) {
-			mutex_lock(&temp->lock);
-			if (temp->state >= MSM_VIDC_OPEN_DONE &&
-					temp->state < MSM_VIDC_STOP_DONE) {
-				dprintk(VIDC_ERR, "%4d|%4d|%4d|%4d\n",
-						temp->session_type,
-						temp->prop.width,
-						temp->prop.height,
-						temp->prop.fps);
-			}
-			mutex_unlock(&temp->lock);
-		}
+		msm_vidc_print_running_insts(inst->core);
 		inst->state = MSM_VIDC_CORE_INVALID;
 		msm_comm_recover_from_session_error(inst);
 		return -ENOMEM;
@@ -2837,6 +2835,29 @@ int msm_vidc_trigger_ssr(struct msm_vidc_core *core,
 	return rc;
 }
 
+static int msm_vidc_load_supported(struct msm_vidc_inst *inst)
+{
+	int num_mbs_per_sec = 0;
+
+	if (inst->state == MSM_VIDC_OPEN_DONE) {
+		num_mbs_per_sec = msm_comm_get_load(inst->core,
+					MSM_VIDC_DECODER);
+		num_mbs_per_sec += msm_comm_get_load(inst->core,
+					MSM_VIDC_ENCODER);
+		if (num_mbs_per_sec > inst->core->resources.max_load) {
+			dprintk(VIDC_ERR,
+				"H/w is overloaded. needed: %d max: %d\n",
+				num_mbs_per_sec,
+				inst->core->resources.max_load);
+			mutex_lock(&inst->sync_lock);
+			msm_vidc_print_running_insts(inst->core);
+			mutex_unlock(&inst->sync_lock);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 int msm_vidc_check_session_supported(struct msm_vidc_inst *inst)
 {
 	struct msm_vidc_core_capability *capability;
@@ -2850,7 +2871,8 @@ int msm_vidc_check_session_supported(struct msm_vidc_inst *inst)
 	capability = &inst->capability;
 	hdev = inst->core->device;
 
-	if (inst->capability.capability_set) {
+	rc = msm_vidc_load_supported(inst);
+	if (!rc && inst->capability.capability_set) {
 		rc = call_hfi_op(hdev, capability_check,
 			inst->fmts[OUTPUT_PORT]->fourcc,
 			inst->prop.width, &capability->width.max,

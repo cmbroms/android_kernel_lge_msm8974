@@ -59,7 +59,6 @@
 #define ADRENO_DEFAULT_PWRSCALE_POLICY  NULL
 #endif
 
-void adreno_debugfs_init(struct kgsl_device *device);
 
 #define ADRENO_ISTORE_START 0x5000 /* Istore offset */
 
@@ -127,7 +126,7 @@ enum coresight_debug_reg {
  */
 struct adreno_dispatcher {
 	struct mutex mutex;
-	unsigned int state;
+	unsigned long priv;
 	struct timer_list timer;
 	struct timer_list fault_timer;
 	unsigned int inflight;
@@ -139,6 +138,10 @@ struct adreno_dispatcher {
 	unsigned int tail;
 	struct work_struct work;
 	struct kobject kobj;
+};
+
+enum adreno_dispatcher_flags {
+	ADRENO_DISPATCHER_POWER = 0,
 };
 
 struct adreno_gpudev;
@@ -165,8 +168,11 @@ struct adreno_device {
 	unsigned int wait_timeout;
 	unsigned int pm4_jt_idx;
 	unsigned int pm4_jt_addr;
+	unsigned int pm4_bstrp_size;
 	unsigned int pfp_jt_idx;
 	unsigned int pfp_jt_addr;
+	unsigned int pfp_bstrp_size;
+	unsigned int pfp_bstrp_ver;
 	unsigned int istore_size;
 	unsigned int pix_shader_start;
 	unsigned int instruction_size;
@@ -195,6 +201,7 @@ struct adreno_device {
 enum adreno_device_flags {
 	ADRENO_DEVICE_PWRON = 0,
 	ADRENO_DEVICE_PWRON_FIXUP = 1,
+	ADRENO_DEVICE_INITIALIZED = 2,
 };
 
 #define PERFCOUNTER_FLAG_NONE 0x0
@@ -355,19 +362,16 @@ struct adreno_gpudev {
 
 	/* GPU specific function hooks */
 	int (*ctxt_create)(struct adreno_device *, struct adreno_context *);
-	int (*ctxt_save)(struct adreno_device *, struct adreno_context *);
-	int (*ctxt_restore)(struct adreno_device *, struct adreno_context *);
-	int (*ctxt_draw_workaround)(struct adreno_device *,
-					struct adreno_context *);
 	irqreturn_t (*irq_handler)(struct adreno_device *);
 	void (*irq_control)(struct adreno_device *, int);
 	unsigned int (*irq_pending)(struct adreno_device *);
 	void * (*snapshot)(struct adreno_device *, void *, int *, int);
 	int (*rb_init)(struct adreno_device *, struct adreno_ringbuffer *);
-	void (*perfcounter_init)(struct adreno_device *);
+	int (*perfcounter_init)(struct adreno_device *);
+	void (*perfcounter_close)(struct adreno_device *);
 	void (*start)(struct adreno_device *);
 	unsigned int (*busy_cycles)(struct adreno_device *);
-	void (*perfcounter_enable)(struct adreno_device *, unsigned int group,
+	int (*perfcounter_enable)(struct adreno_device *, unsigned int group,
 		unsigned int counter, unsigned int countable);
 	uint64_t (*perfcounter_read)(struct adreno_device *adreno_dev,
 		unsigned int group, unsigned int counter);
@@ -476,7 +480,7 @@ struct kgsl_memdesc *adreno_find_ctxtmem(struct kgsl_device *device,
 void *adreno_snapshot(struct kgsl_device *device, void *snapshot, int *remain,
 		int hang);
 
-void adreno_dispatcher_start(struct adreno_device *adreno_dev);
+void adreno_dispatcher_start(struct kgsl_device *device);
 int adreno_dispatcher_init(struct adreno_device *adreno_dev);
 void adreno_dispatcher_close(struct adreno_device *adreno_dev);
 int adreno_dispatcher_idle(struct adreno_device *adreno_dev,
@@ -490,7 +494,6 @@ int adreno_dispatcher_queue_cmd(struct adreno_device *adreno_dev,
 
 void adreno_dispatcher_schedule(struct kgsl_device *device);
 void adreno_dispatcher_pause(struct adreno_device *adreno_dev);
-void adreno_dispatcher_resume(struct adreno_device *adreno_dev);
 void adreno_dispatcher_queue_context(struct kgsl_device *device,
 	struct adreno_context *drawctxt);
 int adreno_reset(struct kgsl_device *device);
@@ -882,6 +885,25 @@ static inline void adreno_vbif_start(struct kgsl_device *device,
 		kgsl_regwrite(device, vbif->reg, vbif->val);
 		vbif++;
 	}
+}
+
+#ifdef CONFIG_DEBUG_FS
+void adreno_debugfs_init(struct kgsl_device *device);
+#else
+static inline void adreno_debugfs_init(struct kgsl_device *device) { }
+#endif
+
+/*
+ * adreno_bootstrap_ucode() - Checks if Ucode bootstrapping is supported
+ * @adreno_dev:		Pointer to the the adreno device
+ */
+static inline int adreno_bootstrap_ucode(struct adreno_device *adreno_dev)
+{
+	if ((adreno_dev->pfp_bstrp_size) && (adreno_dev->pm4_bstrp_size)
+		&& (adreno_dev->pfp_fw_version >= adreno_dev->pfp_bstrp_ver))
+		return 1;
+	else
+		return 0;
 }
 
 #endif /*__ADRENO_H */

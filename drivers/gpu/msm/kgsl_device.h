@@ -131,8 +131,6 @@ struct kgsl_functable {
 		enum kgsl_property_type type, void *value,
 		unsigned int sizebytes);
 	int (*postmortem_dump) (struct kgsl_device *device, int manual);
-	int (*next_event)(struct kgsl_device *device,
-		struct kgsl_event *event);
 	void (*drawctxt_sched)(struct kgsl_device *device,
 		struct kgsl_context *context);
 	void (*resume)(struct kgsl_device *device);
@@ -244,6 +242,7 @@ struct kgsl_device {
 	struct kgsl_mh mh;
 	struct kgsl_mmu mmu;
 	struct completion hwaccess_gate;
+	struct completion cmdbatch_gate;
 	const struct kgsl_functable *ftbl;
 	struct work_struct idle_check_ws;
 	struct timer_list idle_timer;
@@ -315,6 +314,7 @@ void kgsl_process_events(struct work_struct *work);
 
 #define KGSL_DEVICE_COMMON_INIT(_dev) \
 	.hwaccess_gate = COMPLETION_INITIALIZER((_dev).hwaccess_gate),\
+	.cmdbatch_gate = COMPLETION_INITIALIZER((_dev).cmdbatch_gate),\
 	.idle_check_ws = __WORK_INITIALIZER((_dev).idle_check_ws,\
 			kgsl_idle_check),\
 	.ts_expired_ws  = __WORK_INITIALIZER((_dev).ts_expired_ws,\
@@ -358,6 +358,7 @@ struct kgsl_process_private;
  * @pagefault: flag set if this context caused a pagefault.
  * @pagefault_ts: global timestamp of the pagefault, if KGSL_CONTEXT_PAGEFAULT
  * is set.
+ * @flags: flags from userspace controlling the behavior of this context
  */
 struct kgsl_context {
 	struct kref refcount;
@@ -373,10 +374,26 @@ struct kgsl_context {
 	struct list_head events;
 	struct list_head events_list;
 	unsigned int pagefault_ts;
+	unsigned int flags;
 };
 
+/**
+ * struct kgsl_process_private -  Private structure for a KGSL process (across
+ * all devices)
+ * @priv: Internal flags, use KGSL_PROCESS_* values
+ * @pid: ID for the task owner of the process
+ * @mem_lock: Spinlock to protect the process memory lists
+ * @refcount: kref object for reference counting the process
+ * @process_private_mutex: Mutex to synchronize access to the process struct
+ * @mem_rb: RB tree node for the memory owned by this process
+ * @idr: Iterator for assigning IDs to memory allocations
+ * @pagetable: Pointer to the pagetable owned by this process
+ * @kobj: Pointer to a kobj for the sysfs directory for this process
+ * @debug_root: Pointer to the debugfs root for this process
+ * @stats: Memory allocation statistics for this process
+ */
 struct kgsl_process_private {
-	unsigned int refcnt;
+	unsigned long priv;
 	pid_t pid;
 	spinlock_t mem_lock;
 
@@ -396,6 +413,14 @@ struct kgsl_process_private {
 		unsigned int cur;
 		unsigned int max;
 	} stats[KGSL_MEM_ENTRY_MAX];
+};
+
+/**
+ * enum kgsl_process_priv_flags - Private flags for kgsl_process_private
+ * @KGSL_PROCESS_INIT: Set if the process structure has been set up
+ */
+enum kgsl_process_priv_flags {
+	KGSL_PROCESS_INIT = 0,
 };
 
 struct kgsl_device_private {
@@ -530,6 +555,7 @@ void kgsl_context_destroy(struct kref *kref);
 
 int kgsl_context_init(struct kgsl_device_private *, struct kgsl_context
 		*context);
+int kgsl_context_detach(struct kgsl_context *context);
 
 /**
  * kgsl_context_put() - Release context reference count

@@ -824,6 +824,7 @@ static int _get_iommu_ctxs(struct kgsl_mmu *mmu,
 	struct kgsl_iommu_unit *iommu_unit = &iommu->iommu_units[unit_id];
 	int i, j;
 	int found_ctx;
+	int ret = 0;
 
 	for (j = 0; j < KGSL_IOMMU_MAX_DEVS_PER_UNIT; j++) {
 		found_ctx = 0;
@@ -837,16 +838,21 @@ static int _get_iommu_ctxs(struct kgsl_mmu *mmu,
 			break;
 		if (!data->iommu_ctxs[i].iommu_ctx_name) {
 			KGSL_CORE_ERR("Context name invalid\n");
-			return -EINVAL;
+			ret = -EINVAL;
+			goto done;
 		}
 
 		iommu_unit->dev[iommu_unit->dev_count].dev =
 			msm_iommu_get_ctx(data->iommu_ctxs[i].iommu_ctx_name);
-		if (iommu_unit->dev[iommu_unit->dev_count].dev == NULL) {
-			KGSL_CORE_ERR("Failed to get iommu dev handle for "
-			"device %s\n", data->iommu_ctxs[i].iommu_ctx_name);
-			return -EINVAL;
+		if (NULL == iommu_unit->dev[iommu_unit->dev_count].dev)
+			ret = -EINVAL;
+		if (IS_ERR(iommu_unit->dev[iommu_unit->dev_count].dev)) {
+			ret = PTR_ERR(
+				iommu_unit->dev[iommu_unit->dev_count].dev);
+			iommu_unit->dev[iommu_unit->dev_count].dev = NULL;
 		}
+		if (ret)
+			goto done;
 		iommu_unit->dev[iommu_unit->dev_count].ctx_id =
 						data->iommu_ctxs[i].ctx_id;
 		iommu_unit->dev[iommu_unit->dev_count].kgsldev = mmu->device;
@@ -858,12 +864,23 @@ static int _get_iommu_ctxs(struct kgsl_mmu *mmu,
 
 		iommu_unit->dev_count++;
 	}
-	if (!j) {
-		KGSL_CORE_ERR("No ctxts initialized, user ctxt absent\n ");
-		return -EINVAL;
+done:
+	if (!iommu_unit->dev_count && !ret)
+		ret = -EINVAL;
+	if (ret) {
+		/*
+		 * If at least the first context is initialized on v1
+		 * then we can continue
+		 */
+		if (!msm_soc_version_supports_iommu_v0() &&
+			iommu_unit->dev_count)
+			ret = 0;
+		else
+			KGSL_CORE_ERR(
+			"Failed to initialize iommu contexts, err: %d\n", ret);
 	}
 
-	return 0;
+	return ret;
 }
 
 /*
@@ -1148,7 +1165,8 @@ static int kgsl_set_register_map(struct kgsl_mmu *mmu)
 		if (ret)
 			goto err;
 
-		iommu_unit->iommu_halt_enable = data.iommu_halt_enable;
+		if (!msm_soc_version_supports_iommu_v0())
+			iommu_unit->iommu_halt_enable = 1;
 		iommu_unit->ahb_base = data.physstart - mmu->device->reg_phys;
 	}
 	iommu->unit_count = pdata_dev->iommu_count;
@@ -1921,15 +1939,21 @@ static int kgsl_iommu_default_setstate(struct kgsl_mmu *mmu,
 	}
 
 	/* For v0 SMMU GPU needs to be idle for tlb invalidate as well */
-	if (msm_soc_version_supports_iommu_v0())
-		kgsl_idle(mmu->device);
+	if (msm_soc_version_supports_iommu_v0()) {
+		ret = kgsl_idle(mmu->device);
+		if (ret)
+			return ret;
+	}
 
 	/* Acquire GPU-CPU sync Lock here */
 	_iommu_lock();
 
 	if (flags & KGSL_MMUFLAGS_PTUPDATE) {
-		if (!msm_soc_version_supports_iommu_v0())
-			kgsl_idle(mmu->device);
+		if (!msm_soc_version_supports_iommu_v0()) {
+			ret = kgsl_idle(mmu->device);
+			if (ret)
+				goto unlock;
+		}
 		for (i = 0; i < iommu->unit_count; i++) {
 			/* get the lsb value which should not change when
 			 * changing ttbr0 */
@@ -1990,6 +2014,7 @@ static int kgsl_iommu_default_setstate(struct kgsl_mmu *mmu,
 			}
 		}
 	}
+unlock:
 
 	/* Release GPU-CPU sync Lock here */
 	_iommu_unlock();
