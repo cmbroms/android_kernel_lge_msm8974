@@ -41,6 +41,7 @@
 #include <mach/subsystem_restart.h>
 #include <mach/socinfo.h>
 #include <mach/qseecomi.h>
+#include <asm/cacheflush.h>
 #include "qseecom_legacy.h"
 #include "qseecom_kernel.h"
 
@@ -67,6 +68,8 @@
 
 /* Check if enterprise security is activate */
 #define	SCM_IS_ACTIVATED_ID		0x02
+
+#define RPMB_SERVICE			0x2000
 
 enum qseecom_clk_definitions {
 	CLK_DFAB = 0,
@@ -211,6 +214,8 @@ struct qseecom_sg_entry {
 /* Function proto types */
 static int qsee_vote_for_clock(struct qseecom_dev_handle *, int32_t);
 static void qsee_disable_clock_vote(struct qseecom_dev_handle *, int32_t);
+static int __qseecom_enable_clk(enum qseecom_ce_hw_instance ce);
+static void __qseecom_disable_clk(enum qseecom_ce_hw_instance ce);
 
 static int __qseecom_is_svc_unique(struct qseecom_dev_handle *data,
 		struct qseecom_register_listener_req *svc)
@@ -426,7 +431,7 @@ static int qseecom_set_client_mem_param(struct qseecom_dev_handle *data,
 	uint32_t len;
 
 	/* Copy the relevant information needed for loading the image */
-	if (__copy_from_user(&req, (void __user *)argp, sizeof(req)))
+	if (copy_from_user(&req, (void __user *)argp, sizeof(req)))
 		return -EFAULT;
 
 	/* Get the handle of the shared fd */
@@ -515,6 +520,13 @@ static int __qseecom_process_incomplete_cmd(struct qseecom_dev_handle *data,
 		qseecom.send_resp_flag = 0;
 		send_data_rsp.qsee_cmd_id = QSEOS_LISTENER_DATA_RSP_COMMAND;
 		send_data_rsp.listener_id  = lstnr ;
+		if (ptr_svc)
+			msm_ion_do_cache_op(qseecom.ion_clnt, ptr_svc->ihandle,
+					ptr_svc->sb_virt, ptr_svc->sb_length,
+						ION_IOC_CLEAN_INV_CACHES);
+
+		if (lstnr == RPMB_SERVICE)
+			__qseecom_enable_clk(CLK_QSEE);
 
 		ret = scm_call(SCM_SVC_TZSCHEDULER, 1,
 					(const void *)&send_data_rsp,
@@ -523,6 +535,8 @@ static int __qseecom_process_incomplete_cmd(struct qseecom_dev_handle *data,
 		if (ret) {
 			pr_err("scm_call() failed with err: %d (app_id = %d)\n",
 				ret, data->client.app_id);
+			if (lstnr == RPMB_SERVICE)
+				__qseecom_disable_clk(CLK_QSEE);
 			return ret;
 		}
 		if ((resp->result != QSEOS_RESULT_SUCCESS) &&
@@ -531,6 +545,9 @@ static int __qseecom_process_incomplete_cmd(struct qseecom_dev_handle *data,
 				resp->result, data->client.app_id, lstnr);
 			ret = -EINVAL;
 		}
+		if (lstnr == RPMB_SERVICE)
+			__qseecom_disable_clk(CLK_QSEE);
+
 	}
 	if (rc)
 		return rc;
@@ -587,7 +604,7 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 	struct qseecom_load_app_ireq load_req;
 
 	/* Copy the relevant information needed for loading the image */
-	if (__copy_from_user(&load_img_req,
+	if (copy_from_user(&load_img_req,
 				(void __user *)argp,
 				sizeof(struct qseecom_load_img_req))) {
 		pr_err("copy_from_user failed\n");
@@ -598,14 +615,16 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 	if (ret)
 		pr_warning("Unable to vote for SFPB clock");
 	req.qsee_cmd_id = QSEOS_APP_LOOKUP_COMMAND;
+	load_img_req.img_name[MAX_APP_NAME_SIZE-1] = '\0';
 	memcpy(req.app_name, load_img_req.img_name, MAX_APP_NAME_SIZE);
 
 	ret = __qseecom_check_app_exists(req);
-	if (ret < 0)
+	if (ret < 0) {
+		qsee_disable_clock_vote(data, CLK_SFPB);
 		return ret;
-	else
-		app_id = ret;
+	}
 
+	app_id = ret;
 	if (app_id) {
 		pr_debug("App id %d (%s) already exists\n", app_id,
 			(char *)(req.app_name));
@@ -641,6 +660,8 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 		load_req.mdt_len = load_img_req.mdt_len;
 		load_req.img_len = load_img_req.img_len;
 		load_req.phy_addr = pa;
+		msm_ion_do_cache_op(qseecom.ion_clnt, ihandle, NULL, len,
+					ION_IOC_CLEAN_INV_CACHES);
 
 		/*  SCM_CALL  to load the app and get the app_id back */
 		ret = scm_call(SCM_SVC_TZSCHEDULER, 1,  &load_req,
@@ -855,7 +876,7 @@ static int qseecom_send_service_cmd(struct qseecom_dev_handle *data,
 	struct qseecom_send_svc_cmd_req req;
 	/*struct qseecom_command_scm_resp resp;*/
 
-	if (__copy_from_user(&req,
+	if (copy_from_user(&req,
 				(void __user *)argp,
 				sizeof(req))) {
 		pr_err("copy_from_user failed\n");
@@ -880,10 +901,15 @@ static int qseecom_send_service_cmd(struct qseecom_dev_handle *data,
 		pr_err("Unsupported cmd_id %d\n", req.cmd_id);
 		return -EINVAL;
 	}
-
+	msm_ion_do_cache_op(qseecom.ion_clnt, data->client.ihandle,
+				data->client.sb_virt, data->client.sb_length,
+				ION_IOC_CLEAN_INV_CACHES);
 	ret = scm_call(SCM_SVC_TZSCHEDULER, 1, (const void *) &send_svc_ireq,
 					sizeof(send_svc_ireq),
 					&resp, sizeof(resp));
+	msm_ion_do_cache_op(qseecom.ion_clnt, data->client.ihandle,
+				data->client.sb_virt, data->client.sb_length,
+				ION_IOC_INV_CACHES);
 	if (ret) {
 		pr_err("qseecom_scm_call failed with err: %d\n", ret);
 		return ret;
@@ -952,6 +978,11 @@ static int __qseecom_send_cmd(struct qseecom_dev_handle *data,
 					(uint32_t)req->resp_buf));
 	send_data_req.rsp_len = req->resp_len;
 
+	msm_ion_do_cache_op(qseecom.ion_clnt, data->client.ihandle,
+					data->client.sb_virt,
+					(req->cmd_req_len + req->resp_len),
+					ION_IOC_CLEAN_INV_CACHES);
+
 	ret = scm_call(SCM_SVC_TZSCHEDULER, 1, (const void *) &send_data_req,
 					sizeof(send_data_req),
 					&resp, sizeof(resp));
@@ -974,6 +1005,9 @@ static int __qseecom_send_cmd(struct qseecom_dev_handle *data,
 			ret = -EINVAL;
 		}
 	}
+	msm_ion_do_cache_op(qseecom.ion_clnt, data->client.ihandle,
+				data->client.sb_virt, data->client.sb_length,
+				ION_IOC_INV_CACHES);
 	return ret;
 }
 
@@ -1005,6 +1039,8 @@ static int __qseecom_update_cmd_buf(struct qseecom_send_modfd_cmd_req *req,
 	char *field;
 	int ret = 0;
 	int i = 0;
+	uint32_t len = 0;
+	struct scatterlist *sg;
 
 	for (i = 0; i < MAX_ION_FD; i++) {
 		struct sg_table *sg_ptr = NULL;
@@ -1035,6 +1071,7 @@ static int __qseecom_update_cmd_buf(struct qseecom_send_modfd_cmd_req *req,
 					sg_ptr->nents, QSEECOM_MAX_SG_ENTRY);
 				goto err;
 			}
+			sg = sg_ptr->sgl;
 			if (sg_ptr->nents == 1) {
 				uint32_t *update;
 				update = (uint32_t *) field;
@@ -1043,12 +1080,11 @@ static int __qseecom_update_cmd_buf(struct qseecom_send_modfd_cmd_req *req,
 				else
 					*update = (uint32_t)sg_dma_address(
 								sg_ptr->sgl);
+				len += (uint32_t)sg->length;
 			} else {
 				struct qseecom_sg_entry *update;
-				struct scatterlist *sg;
 				int j = 0;
 				update = (struct qseecom_sg_entry *) field;
-				sg = sg_ptr->sgl;
 				for (j = 0; j < sg_ptr->nents; j++) {
 					if (cleanup) {
 						update->phys_addr = 0;
@@ -1058,10 +1094,19 @@ static int __qseecom_update_cmd_buf(struct qseecom_send_modfd_cmd_req *req,
 							sg_dma_address(sg);
 						update->len = sg->length;
 					}
+					len += sg->length;
 					update++;
 					sg = sg_next(sg);
 				}
 			}
+			if (cleanup)
+				msm_ion_do_cache_op(qseecom.ion_clnt,
+						ihandle, NULL, len,
+						ION_IOC_INV_CACHES);
+			else
+				msm_ion_do_cache_op(qseecom.ion_clnt,
+						ihandle, NULL, len,
+						ION_IOC_CLEAN_INV_CACHES);
 			/* Deallocate the handle */
 			if (!IS_ERR_OR_NULL(ihandle))
 				ion_free(qseecom.ion_clnt, ihandle);
@@ -1288,6 +1333,7 @@ static int __qseecom_load_fw(struct qseecom_dev_handle *data, char *appname)
 		return -EIO;
 	}
 
+	__cpuc_flush_dcache_area((void *)img_data, fw_size);
 	/* SCM_CALL to load the image */
 	ret = scm_call(SCM_SVC_TZSCHEDULER, 1,	&load_req,
 			sizeof(struct qseecom_load_app_ireq),
@@ -1354,6 +1400,7 @@ static int qseecom_load_commonlib_image(struct qseecom_dev_handle *data)
 		return -EIO;
 	}
 
+	__cpuc_flush_dcache_area((void *)img_data, fw_size);
 	/* SCM_CALL to load the image */
 	ret = scm_call(SCM_SVC_TZSCHEDULER, 1, &load_req,
 				sizeof(struct qseecom_load_lib_image_ireq),
@@ -1945,7 +1992,7 @@ static int qseecom_load_external_elf(struct qseecom_dev_handle *data,
 	struct qseecom_command_scm_resp resp;
 
 	/* Copy the relevant information needed for loading the image */
-	if (__copy_from_user(&load_img_req,
+	if (copy_from_user(&load_img_req,
 				(void __user *)argp,
 				sizeof(struct qseecom_load_img_req))) {
 		pr_err("copy_from_user failed\n");
@@ -1976,16 +2023,18 @@ static int qseecom_load_external_elf(struct qseecom_dev_handle *data,
 		pr_err("set_cpus_allowed_ptr failed : ret %d\n",
 				set_cpu_ret);
 		ret = -EFAULT;
-		goto qseecom_load_external_elf_set_cpu_err;
+		goto exit_ion_free;
 	}
+
 	/* Vote for the SFPB clock */
 	ret = qsee_vote_for_clock(data, CLK_SFPB);
 	if (ret) {
 		pr_err("Unable to vote for SFPB clock: ret = %d", ret);
 		ret = -EIO;
-		goto qseecom_load_external_elf_set_cpu_err;
+		goto exit_cpu_restore;
 	}
-
+	msm_ion_do_cache_op(qseecom.ion_clnt, ihandle, NULL, len,
+				ION_IOC_CLEAN_INV_CACHES);
 	/*  SCM_CALL to load the external elf */
 	ret = scm_call(SCM_SVC_TZSCHEDULER, 1,  &load_req,
 			sizeof(struct qseecom_load_app_ireq),
@@ -1994,23 +2043,32 @@ static int qseecom_load_external_elf(struct qseecom_dev_handle *data,
 		pr_err("scm_call to load failed : ret %d\n",
 				ret);
 		ret = -EFAULT;
-		goto qseecom_load_external_elf_scm_err;
+		goto exit_disable_clock;
 	}
 
-	if (resp.result == QSEOS_RESULT_INCOMPLETE) {
+	switch (resp.result) {
+	case QSEOS_RESULT_SUCCESS:
+		break;
+	case QSEOS_RESULT_INCOMPLETE:
+		pr_err("%s: qseos result incomplete\n", __func__);
 		ret = __qseecom_process_incomplete_cmd(data, &resp);
 		if (ret)
-			pr_err("process_incomplete_cmd failed err: %d\n",
-					ret);
-	} else {
-		if (resp.result != QSEOS_RESULT_SUCCESS) {
-			pr_err("scm_call to load image failed resp.result =%d\n",
-						resp.result);
-			ret = -EFAULT;
-		}
+			pr_err("process_incomplete_cmd failed: err: %d\n", ret);
+		break;
+	case QSEOS_RESULT_FAILURE:
+		pr_err("scm_call rsp.result is QSEOS_RESULT_FAILURE\n");
+		ret = -EFAULT;
+		break;
+	default:
+		pr_err("scm_call response result %d not supported\n",
+							resp.result);
+		ret = -EFAULT;
+		break;
 	}
 
-qseecom_load_external_elf_scm_err:
+exit_disable_clock:
+	qsee_disable_clock_vote(data, CLK_SFPB);
+exit_cpu_restore:
 	/* Restore the CPU mask */
 	mask = CPU_MASK_ALL;
 	set_cpu_ret = set_cpus_allowed_ptr(current, &mask);
@@ -2019,12 +2077,10 @@ qseecom_load_external_elf_scm_err:
 				set_cpu_ret);
 		ret = -EFAULT;
 	}
-
-qseecom_load_external_elf_set_cpu_err:
+exit_ion_free:
 	/* Deallocate the handle */
 	if (!IS_ERR_OR_NULL(ihandle))
 		ion_free(qseecom.ion_clnt, ihandle);
-	qsee_disable_clock_vote(data, CLK_SFPB);
 	return ret;
 }
 
@@ -2095,7 +2151,7 @@ static int qseecom_query_app_loaded(struct qseecom_dev_handle *data,
 	unsigned long flags = 0;
 
 	/* Copy the relevant information needed for loading the image */
-	if (__copy_from_user(&query_req,
+	if (copy_from_user(&query_req,
 				(void __user *)argp,
 				sizeof(struct qseecom_qseos_app_load_query))) {
 		pr_err("copy_from_user failed\n");
@@ -2103,6 +2159,7 @@ static int qseecom_query_app_loaded(struct qseecom_dev_handle *data,
 	}
 
 	req.qsee_cmd_id = QSEOS_APP_LOOKUP_COMMAND;
+	query_req.app_name[MAX_APP_NAME_SIZE-1] = '\0';
 	memcpy(req.app_name, query_req.app_name, MAX_APP_NAME_SIZE);
 
 	ret = __qseecom_check_app_exists(req);
@@ -2498,7 +2555,7 @@ static int qseecom_save_partition_hash(void __user *argp)
 	ret = scm_call(SCM_SVC_ES, SCM_SAVE_PARTITION_HASH_ID,
 		       (void *) &req, sizeof(req), NULL, 0);
 	if (ret) {
-		pr_err("scm_call failed");
+		pr_err("qseecom_scm_call failed");
 		return ret;
 	}
 
