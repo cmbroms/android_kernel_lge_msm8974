@@ -135,6 +135,9 @@ struct snd_card {
 	atomic_t refcount;		/* refcount for disconnection */
 	struct device *dev;		/* device assigned to this card */
 	struct device *card_dev;	/* cardX object for sysfs */
+	int offline;			/* if this sound card is offline */
+	unsigned long offline_change;
+	wait_queue_head_t offline_poll_wait;
 
 #ifdef CONFIG_PM
 	unsigned int power_state;	/* power state */

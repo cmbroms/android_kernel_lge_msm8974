@@ -869,7 +869,9 @@ static inline void idle_balance(int cpu, struct rq *rq)
 
 #endif
 
+#ifdef CONFIG_SYSRQ_SCHED_DEBUG
 extern void sysrq_sched_debug_show(void);
+#endif
 extern void sched_init_granularity(void);
 extern void update_max_interval(void);
 extern void update_group_power(struct sched_domain *sd, int cpu);
@@ -923,11 +925,13 @@ static inline void cpuacct_charge(struct task_struct *tsk, u64 cputime) {}
 
 static inline void inc_nr_running(struct rq *rq)
 {
+	sched_update_nr_prod(cpu_of(rq), rq->nr_running, true);
 	rq->nr_running++;
 }
 
 static inline void dec_nr_running(struct rq *rq)
 {
+	sched_update_nr_prod(cpu_of(rq), rq->nr_running, false);
 	rq->nr_running--;
 }
 
@@ -1148,7 +1152,6 @@ extern void print_rt_stats(struct seq_file *m, int cpu);
 
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
 extern void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq);
-extern void unthrottle_offline_cfs_rqs(struct rq *rq);
 
 extern void account_cfs_bandwidth_used(int enabled, int was_enabled);
 

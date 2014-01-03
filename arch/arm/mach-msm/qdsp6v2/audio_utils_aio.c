@@ -250,7 +250,11 @@ void audio_aio_async_write_ack(struct q6audio_aio *audio, uint32_t token,
 		return;
 
 	spin_lock_irqsave(&audio->dsp_lock, flags);
-	BUG_ON(list_empty(&audio->out_queue));
+	if (list_empty(&audio->out_queue)) {
+		pr_warning("%s: ingore unexpected event from dsp\n", __func__);
+		spin_unlock_irqrestore(&audio->dsp_lock, flags);
+		return;
+	}
 	used_buf = list_first_entry(&audio->out_queue,
 					struct audio_aio_buffer_node, list);
 	if (token == used_buf->token) {
@@ -1162,9 +1166,6 @@ int audio_aio_open(struct q6audio_aio *audio, struct file *file)
 	return 0;
 
 fail:
-	q6asm_audio_client_free(audio->ac);
-	kfree(audio->codec_cfg);
-	kfree(audio);
 	return rc;
 }
 
@@ -1175,8 +1176,9 @@ long audio_aio_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case AUDIO_GET_STATS: {
-		struct msm_audio_stats stats;
+		struct msm_audio_stats stats = {0,};
 		uint64_t timestamp;
+		memset(&stats, 0, sizeof(struct msm_audio_stats));
 		stats.byte_count = atomic_read(&audio->in_bytes);
 		stats.sample_count = atomic_read(&audio->in_samples);
 		rc = q6asm_get_session_time(audio->ac, &timestamp);

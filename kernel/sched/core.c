@@ -621,7 +621,19 @@ void wake_up_idle_cpu(int cpu)
 static inline bool got_nohz_idle_kick(void)
 {
 	int cpu = smp_processor_id();
-	return idle_cpu(cpu) && test_bit(NOHZ_BALANCE_KICK, nohz_flags(cpu));
+
+	if (!test_bit(NOHZ_BALANCE_KICK, nohz_flags(cpu)))
+		return false;
+
+	if (idle_cpu(cpu) && !need_resched())
+		return true;
+
+	/*
+	 * We can't run Idle Load Balance on this CPU for this time so we
+	 * cancel it and clear NOHZ_BALANCE_KICK
+	 */
+	clear_bit(NOHZ_BALANCE_KICK, nohz_flags(cpu));
+	return false;
 }
 
 #else /* CONFIG_NO_HZ */
@@ -727,6 +739,7 @@ static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	update_rq_clock(rq);
 	sched_info_queued(p);
 	p->sched_class->enqueue_task(rq, p, flags);
+	trace_sched_enq_deq_task(p, 1);
 }
 
 static void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
@@ -734,6 +747,7 @@ static void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 	update_rq_clock(rq);
 	sched_info_dequeued(p);
 	p->sched_class->dequeue_task(rq, p, flags);
+	trace_sched_enq_deq_task(p, 0);
 }
 
 void activate_task(struct rq *rq, struct task_struct *p, int flags)
@@ -1517,7 +1531,7 @@ void scheduler_ipi(void)
 	/*
 	 * Check if someone kicked us for doing the nohz idle load balance.
 	 */
-	if (unlikely(got_nohz_idle_kick() && !need_resched())) {
+	if (unlikely(got_nohz_idle_kick())) {
 		this_rq()->idle_balance = 1;
 		raise_softirq_irqoff(SCHED_SOFTIRQ);
 	}
@@ -1668,8 +1682,8 @@ static void try_to_wake_up_local(struct task_struct *p)
 {
 	struct rq *rq = task_rq(p);
 
-	if (WARN_ON_ONCE(rq != this_rq()) ||
-	    WARN_ON_ONCE(p == current))
+	if (WARN_ON(rq != this_rq()) ||
+	    WARN_ON(p == current))
 		return;
 
 	lockdep_assert_held(&rq->lock);
@@ -3699,8 +3713,7 @@ void complete_all(struct completion *x)
 EXPORT_SYMBOL(complete_all);
 
 static inline long __sched
-do_wait_for_common(struct completion *x,
-		   long (*action)(long), long timeout, int state)
+do_wait_for_common(struct completion *x, long timeout, int state, int iowait)
 {
 	if (!x->done) {
 		DECLARE_WAITQUEUE(wait, current);
@@ -3713,7 +3726,10 @@ do_wait_for_common(struct completion *x,
 			}
 			__set_current_state(state);
 			spin_unlock_irq(&x->wait.lock);
-			timeout = action(timeout);
+			if (iowait)
+				timeout = io_schedule_timeout(timeout);
+			else
+				timeout = schedule_timeout(timeout);
 			spin_lock_irq(&x->wait.lock);
 		} while (!x->done && timeout);
 		__remove_wait_queue(&x->wait, &wait);
@@ -3724,28 +3740,15 @@ do_wait_for_common(struct completion *x,
 	return timeout ?: 1;
 }
 
-static inline long __sched
-__wait_for_common(struct completion *x,
-		  long (*action)(long), long timeout, int state)
+static long __sched
+wait_for_common(struct completion *x, long timeout, int state, int iowait)
 {
 	might_sleep();
 
 	spin_lock_irq(&x->wait.lock);
-	timeout = do_wait_for_common(x, action, timeout, state);
+	timeout = do_wait_for_common(x, timeout, state, iowait);
 	spin_unlock_irq(&x->wait.lock);
 	return timeout;
-}
-
-static long __sched
-wait_for_common(struct completion *x, long timeout, int state)
-{
-	return __wait_for_common(x, schedule_timeout, timeout, state);
-}
-
-static long __sched
-wait_for_common_io(struct completion *x, long timeout, int state)
-{
-	return __wait_for_common(x, io_schedule_timeout, timeout, state);
 }
 
 /**
@@ -3760,7 +3763,7 @@ wait_for_common_io(struct completion *x, long timeout, int state)
  */
 void __sched wait_for_completion(struct completion *x)
 {
-	wait_for_common(x, MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE);
+	wait_for_common(x, MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE, 0);
 }
 EXPORT_SYMBOL(wait_for_completion);
 
@@ -3773,7 +3776,7 @@ EXPORT_SYMBOL(wait_for_completion);
  */
 void __sched wait_for_completion_io(struct completion *x)
 {
-	wait_for_common(x, MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE);
+	wait_for_common(x, MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE, 1);
 }
 EXPORT_SYMBOL(wait_for_completion_io);
 
@@ -3793,28 +3796,9 @@ EXPORT_SYMBOL(wait_for_completion_io);
 unsigned long __sched
 wait_for_completion_timeout(struct completion *x, unsigned long timeout)
 {
-	return wait_for_common(x, timeout, TASK_UNINTERRUPTIBLE);
+	return wait_for_common(x, timeout, TASK_UNINTERRUPTIBLE, 0);
 }
 EXPORT_SYMBOL(wait_for_completion_timeout);
-
-/**
- * wait_for_completion_io_timeout: - waits for completion of a task (w/timeout)
- * @x:  holds the state of this particular completion
- * @timeout:  timeout value in jiffies
- *
- * This waits for either a completion of a specific task to be signaled or for a
- * specified timeout to expire. The timeout is in jiffies. It is not
- * interruptible. The caller is accounted as waiting for IO.
- *
- * The return value is 0 if timed out, and positive (at least 1, or number of
- * jiffies left till timeout) if completed.
- */
-unsigned long __sched
-wait_for_completion_io_timeout(struct completion *x, unsigned long timeout)
-{
-	return wait_for_common_io(x, timeout, TASK_UNINTERRUPTIBLE);
-}
-EXPORT_SYMBOL(wait_for_completion_io_timeout);
 
 /**
  * wait_for_completion_interruptible: - waits for completion of a task (w/intr)
@@ -3828,7 +3812,7 @@ EXPORT_SYMBOL(wait_for_completion_io_timeout);
 int __sched wait_for_completion_interruptible(struct completion *x)
 {
 	long t = wait_for_common(x, MAX_SCHEDULE_TIMEOUT,
-				 TASK_INTERRUPTIBLE);
+				 TASK_INTERRUPTIBLE, 0);
 	if (t == -ERESTARTSYS)
 		return t;
 	return 0;
@@ -3850,7 +3834,7 @@ long __sched
 wait_for_completion_interruptible_timeout(struct completion *x,
 					  unsigned long timeout)
 {
-	return wait_for_common(x, timeout, TASK_INTERRUPTIBLE);
+	return wait_for_common(x, timeout, TASK_INTERRUPTIBLE, 0);
 }
 EXPORT_SYMBOL(wait_for_completion_interruptible_timeout);
 
@@ -3865,7 +3849,7 @@ EXPORT_SYMBOL(wait_for_completion_interruptible_timeout);
  */
 int __sched wait_for_completion_killable(struct completion *x)
 {
-	long t = wait_for_common(x, MAX_SCHEDULE_TIMEOUT, TASK_KILLABLE);
+	long t = wait_for_common(x, MAX_SCHEDULE_TIMEOUT, TASK_KILLABLE, 0);
 	if (t == -ERESTARTSYS)
 		return t;
 	return 0;
@@ -3888,7 +3872,7 @@ long __sched
 wait_for_completion_killable_timeout(struct completion *x,
 				     unsigned long timeout)
 {
-	return wait_for_common(x, timeout, TASK_KILLABLE);
+	return wait_for_common(x, timeout, TASK_KILLABLE, 0);
 }
 EXPORT_SYMBOL(wait_for_completion_killable_timeout);
 
@@ -5087,7 +5071,7 @@ void show_state_filter(unsigned long state_filter)
 
 	touch_all_softlockup_watchdogs();
 
-#ifdef CONFIG_SCHED_DEBUG
+#ifdef CONFIG_SYSRQ_SCHED_DEBUG
 	sysrq_sched_debug_show();
 #endif
 	rcu_read_unlock();
@@ -5371,9 +5355,6 @@ static void migrate_tasks(unsigned int dead_cpu)
 	 * done here.
 	 */
 	rq->stop = NULL;
-
-	/* Ensure any throttled groups are reachable by pick_next_task */
-	unthrottle_offline_cfs_rqs(rq);
 
 	for ( ; ; ) {
 		/*
@@ -6062,6 +6043,7 @@ cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
 	struct sched_domain *tmp;
+	unsigned long next_balance = rq->next_balance;
 
 	/* Remove the sched domains which do not contribute to scheduling. */
 	for (tmp = sd; tmp; ) {
@@ -6085,6 +6067,17 @@ cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
 		if (sd)
 			sd->child = NULL;
 	}
+
+	for (tmp = sd; tmp; ) {
+		unsigned long interval;
+
+		interval = msecs_to_jiffies(tmp->balance_interval);
+		if (time_after(next_balance, tmp->last_balance + interval))
+			next_balance = tmp->last_balance + interval;
+
+		tmp = tmp->parent;
+	}
+	rq->next_balance = next_balance;
 
 	sched_domain_debug(sd, cpu);
 

@@ -808,6 +808,7 @@ static DEFINE_CLK_VOTER(ocmemgx_msmbus_clk, &ocmemgx_clk.c, LONG_MAX);
 static DEFINE_CLK_VOTER(ocmemgx_msmbus_a_clk, &ocmemgx_a_clk.c, LONG_MAX);
 static DEFINE_CLK_VOTER(ocmemgx_core_clk, &ocmemgx_clk.c, LONG_MAX);
 
+static DEFINE_CLK_VOTER(pnoc_keepalive_a_clk, &pnoc_a_clk.c, LONG_MAX);
 static DEFINE_CLK_VOTER(pnoc_sps_clk, &pnoc_clk.c, 0);
 
 static DEFINE_CLK_BRANCH_VOTER(cxo_otg_clk, &cxo_clk_src.c);
@@ -3655,6 +3656,7 @@ static struct branch_clk camss_csi3rdi_clk = {
 
 static struct branch_clk camss_csi_vfe0_clk = {
 	.cbcr_reg = CAMSS_CSI_VFE0_CBCR,
+	.bcr_reg = CAMSS_CSI_VFE0_BCR,
 	.has_sibling = 1,
 	.base = &virt_bases[MMSS_BASE],
 	.c = {
@@ -3667,6 +3669,7 @@ static struct branch_clk camss_csi_vfe0_clk = {
 
 static struct branch_clk camss_csi_vfe1_clk = {
 	.cbcr_reg = CAMSS_CSI_VFE1_CBCR,
+	.bcr_reg = CAMSS_CSI_VFE1_BCR,
 	.has_sibling = 1,
 	.base = &virt_bases[MMSS_BASE],
 	.c = {
@@ -3714,6 +3717,7 @@ static struct branch_clk camss_ispif_ahb_clk = {
 
 static struct branch_clk camss_jpeg_jpeg0_clk = {
 	.cbcr_reg = CAMSS_JPEG_JPEG0_CBCR,
+	.bcr_reg = CAMSS_JPEG_BCR,
 	.has_sibling = 0,
 	.base = &virt_bases[MMSS_BASE],
 	.c = {
@@ -3914,6 +3918,7 @@ static struct branch_clk camss_vfe_cpp_clk = {
 
 static struct branch_clk camss_vfe_vfe0_clk = {
 	.cbcr_reg = CAMSS_VFE_VFE0_CBCR,
+	.bcr_reg = CAMSS_VFE_BCR,
 	.has_sibling = 1,
 	.base = &virt_bases[MMSS_BASE],
 	.c = {
@@ -4115,6 +4120,7 @@ static struct branch_clk mdss_hdmi_clk = {
 
 static struct branch_clk mdss_mdp_clk = {
 	.cbcr_reg = MDSS_MDP_CBCR,
+	.bcr_reg = MDSS_BCR,
 	.has_sibling = 1,
 	.base = &virt_bases[MMSS_BASE],
 	.c = {
@@ -4308,6 +4314,7 @@ static struct branch_clk oxilicx_axi_clk = {
 
 static struct branch_clk oxili_gfx3d_clk = {
 	.cbcr_reg = OXILI_GFX3D_CBCR,
+	.bcr_reg = OXILI_BCR,
 	.base = &virt_bases[MMSS_BASE],
 	.c = {
 		.parent = &oxili_gfx3d_clk_src.c,
@@ -5344,6 +5351,7 @@ static struct clk_lookup msm_clocks_8974[] = {
 	CLK_LOOKUP("core_clk", gcc_prng_ahb_clk.c, "msm_rng"),
 
 	CLK_LOOKUP("dfab_clk", pnoc_sps_clk.c, "msm_sps"),
+	CLK_LOOKUP("bus_clk", pnoc_keepalive_a_clk.c, ""),
 
 	CLK_LOOKUP("bus_clk", snoc_clk.c, ""),
 	CLK_LOOKUP("bus_clk", pnoc_clk.c, ""),
@@ -5612,6 +5620,12 @@ static void __init msm8974_clock_post_init(void)
 	 */
 	clk_set_rate(&mmssnoc_ahb_a_clk.c, 40000000);
 	clk_prepare_enable(&mmssnoc_ahb_a_clk.c);
+
+	/*
+	 * Hold an active set vote for the PNOC AHB source. Sleep set vote is 0.
+	 */
+	clk_set_rate(&pnoc_keepalive_a_clk.c, 19200000);
+	clk_prepare_enable(&pnoc_keepalive_a_clk.c);
 
 	/*
 	 * Hold an active set vote for CXO; this is because CXO is expected

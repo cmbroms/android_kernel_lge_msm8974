@@ -140,13 +140,6 @@ void panic(const char *fmt, ...)
 	if (is_console_locked())
 		console_unlock();
 
-	/* print last_kmsg even after console suspend */
-	if (is_console_suspended())
-		resume_console();
-
-	if (is_console_locked())
-		console_unlock();
-
 	/*
 	 * Note smp_send_stop is the usual smp shutdown function, which
 	 * unfortunately means it may not be hardened to work in a panic

@@ -25,7 +25,7 @@
 #include <linux/platform_device.h>
 #include <linux/clk.h>
 #include <linux/err.h>
-#include <linux/wakelock.h>
+#include <linux/pm_wakeup.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 
@@ -36,6 +36,7 @@
 #include <mach/clk.h>
 #include <mach/msm_xo.h>
 #include <mach/msm_iomap.h>
+#include <linux/debugfs.h>
 
 #define MSM_USB_BASE (hcd->regs)
 
@@ -62,7 +63,7 @@ struct msm_hcd {
 	bool					pmic_gpio_dp_irq_enabled;
 	uint32_t				pmic_gpio_int_cnt;
 	atomic_t				pm_usage_cnt;
-	struct wake_lock			wlock;
+	struct wakeup_source			ws;
 	struct work_struct			phy_susp_fail_work;
 	int					async_irq;
 	bool					async_irq_enabled;
@@ -683,7 +684,7 @@ static int msm_ehci_suspend(struct msm_hcd *mhcd)
 		enable_irq_wake(mhcd->async_irq);
 		enable_irq(mhcd->async_irq);
 	}
-	wake_unlock(&mhcd->wlock);
+	pm_relax(mhcd->dev);
 
 	dev_info(mhcd->dev, "EHCI USB in low power mode\n");
 
@@ -716,7 +717,7 @@ static int msm_ehci_resume(struct msm_hcd *mhcd)
 	}
 	spin_unlock_irqrestore(&mhcd->wakeup_lock, flags);
 
-	wake_lock(&mhcd->wlock);
+	pm_stay_awake(mhcd->dev);
 
 	/* Vote for TCXO when waking up the phy */
 	if (!IS_ERR(mhcd->xo_clk)) {
@@ -801,7 +802,7 @@ static irqreturn_t msm_async_irq(int irq, void *data)
 	dev_dbg(mhcd->dev, "%s: hsusb host remote wakeup interrupt cnt: %u\n",
 			__func__, mhcd->async_int_cnt);
 
-	wake_lock(&mhcd->wlock);
+	pm_stay_awake(mhcd->dev);
 
 	spin_lock(&mhcd->wakeup_lock);
 	if (mhcd->async_irq_enabled) {
@@ -832,7 +833,7 @@ static irqreturn_t msm_ehci_host_wakeup_irq(int irq, void *data)
 			__func__, mhcd->pmic_gpio_int_cnt);
 
 
-	wake_lock(&mhcd->wlock);
+	pm_stay_awake(mhcd->dev);
 
 	if (mhcd->pmic_gpio_dp_irq_enabled) {
 		mhcd->pmic_gpio_dp_irq_enabled = 0;
@@ -895,6 +896,135 @@ static int msm_ehci_reset(struct usb_hcd *hcd)
 	ehci_port_power(ehci, 1);
 	return 0;
 }
+
+#if defined(CONFIG_DEBUG_FS)
+static u32 addr;
+#define BUF_SIZE	32
+static ssize_t debug_read_phy_data(struct file *file, char __user *ubuf,
+				 size_t count, loff_t *ppos)
+{
+	struct msm_hcd *mhcd = file->private_data;
+	char *kbuf;
+	size_t c = 0;
+	u32 data = 0;
+	int ret = 0;
+
+	kbuf = kzalloc(sizeof(char) * BUF_SIZE, GFP_KERNEL);
+	pm_runtime_get(mhcd->dev);
+	data = msm_ulpi_read(mhcd, addr);
+	pm_runtime_put(mhcd->dev);
+	if (data < 0) {
+		dev_err(mhcd->dev,
+				"%s(): ulpi read timeout\n", __func__);
+		return -ETIMEDOUT;
+	}
+
+	c = scnprintf(kbuf, BUF_SIZE, "addr: 0x%x: data: 0x%x\n", addr, data);
+
+	ret = simple_read_from_buffer(ubuf, count, ppos, kbuf, c);
+
+	kfree(kbuf);
+
+	return ret;
+}
+
+static ssize_t debug_write_phy_data(struct file *file, const char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	struct msm_hcd *mhcd = file->private_data;
+	char kbuf[10];
+	u32 data = 0;
+
+	memset(kbuf, 0, 10);
+
+	if (copy_from_user(kbuf, buf, count > 10 ? 10 : count))
+		return -EFAULT;
+
+	if (sscanf(kbuf, "%x", &data) != 1)
+		return -EINVAL;
+
+	pm_runtime_get(mhcd->dev);
+	if (msm_ulpi_write(mhcd, data, addr) < 0) {
+		dev_err(mhcd->dev,
+				"%s(): ulpi write timeout\n", __func__);
+		return -ETIMEDOUT;
+	}
+	pm_runtime_put(mhcd->dev);
+
+	return count;
+}
+
+static ssize_t debug_phy_write_addr(struct file *file, const char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	char kbuf[10];
+	u32 temp;
+
+	memset(kbuf, 0, 10);
+
+	if (copy_from_user(kbuf, buf, count > 10 ? 10 : count))
+		return -EFAULT;
+
+	if (sscanf(kbuf, "%x", &temp) != 1)
+		return -EINVAL;
+
+	if (temp > 0x3F)
+		return -EINVAL;
+
+	addr = temp;
+
+	return count;
+}
+
+static int debug_open(struct inode *inode, struct file *file)
+{
+	file->private_data = inode->i_private;
+	return 0;
+}
+
+const struct file_operations debug_rw_phy_ops = {
+	.open = debug_open,
+	.read = debug_read_phy_data,
+	.write = debug_write_phy_data,
+};
+
+const struct file_operations debug_write_phy_ops = {
+	.open = debug_open,
+	.write = debug_phy_write_addr,
+};
+
+static struct dentry *dent_ehci;
+
+static int ehci_debugfs_init(struct msm_hcd *mhcd)
+{
+	struct dentry *debug_phy_data;
+	struct dentry *debug_phy_addr;
+
+	dent_ehci = debugfs_create_dir(dev_name(mhcd->dev), 0);
+	if (IS_ERR(dent_ehci))
+		return -ENOENT;
+
+	debug_phy_data = debugfs_create_file("phy_reg_data", 0666,
+					dent_ehci, mhcd, &debug_rw_phy_ops);
+	if (!debug_phy_data) {
+		debugfs_remove(dent_ehci);
+		return -ENOENT;
+	}
+
+	debug_phy_addr = debugfs_create_file("phy_reg_addr", 0666,
+					dent_ehci, mhcd, &debug_write_phy_ops);
+	if (!debug_phy_addr) {
+		debugfs_remove_recursive(dent_ehci);
+		return -ENOENT;
+	}
+	return 0;
+}
+#else
+static int ehci_debugfs_init(struct msm_hcd *mhcd)
+{
+	return 0;
+}
+#endif
 
 static struct hc_driver msm_hc2_driver = {
 	.description		= hcd_name,
@@ -1178,8 +1308,8 @@ static int __devinit ehci_msm2_probe(struct platform_device *pdev)
 		msm_ehci_vbus_power(mhcd, 1);
 
 	device_init_wakeup(&pdev->dev, 1);
-	wake_lock_init(&mhcd->wlock, WAKE_LOCK_SUSPEND, dev_name(&pdev->dev));
-	wake_lock(&mhcd->wlock);
+	wakeup_source_init(&mhcd->ws, dev_name(&pdev->dev));
+	pm_stay_awake(mhcd->dev);
 	INIT_WORK(&mhcd->phy_susp_fail_work, msm_ehci_phy_susp_fail_work);
 	/*
 	 * This pdev->dev is assigned parent of root-hub by USB core,
@@ -1204,6 +1334,9 @@ static int __devinit ehci_msm2_probe(struct platform_device *pdev)
 	}
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
+
+	if (ehci_debugfs_init(mhcd) < 0)
+		dev_err(mhcd->dev, "%s: debugfs init failed\n", __func__);
 
 	return 0;
 
@@ -1271,10 +1404,13 @@ static int __devexit ehci_msm2_remove(struct platform_device *pdev)
 	msm_ehci_init_vddcx(mhcd, 0);
 
 	msm_ehci_init_clocks(mhcd, 0);
-	wake_lock_destroy(&mhcd->wlock);
+	wakeup_source_trash(&mhcd->ws);
 	iounmap(hcd->regs);
 	usb_put_hcd(hcd);
 
+#if defined(CONFIG_DEBUG_FS)
+	debugfs_remove_recursive(dent_ehci);
+#endif
 	return 0;
 }
 

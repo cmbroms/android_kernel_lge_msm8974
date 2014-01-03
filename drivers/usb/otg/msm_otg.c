@@ -87,6 +87,11 @@ module_param(lpm_disconnect_thresh , uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(lpm_disconnect_thresh,
 	"Delay before entering LPM on USB disconnect");
 
+static bool floated_charger_enable;
+module_param(floated_charger_enable , bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(floated_charger_enable,
+	"Whether to enable floated charger");
+
 static DECLARE_COMPLETION(pmic_vbus_init);
 static struct msm_otg *the_msm_otg;
 static bool debug_aca_enabled;
@@ -851,6 +856,24 @@ static int msm_otg_set_suspend(struct usb_phy *phy, int suspend)
 	return 0;
 }
 
+static void msm_otg_bus_vote(struct msm_otg *motg, enum usb_bus_vote vote)
+{
+	int ret;
+	struct msm_otg_platform_data *pdata = motg->pdata;
+
+	/* Check if target allows min_vote to be same as no_vote */
+	if (vote >= pdata->bus_scale_table->num_usecases)
+		vote = USB_NO_PERF_VOTE;
+
+	if (motg->bus_perf_client) {
+		ret = msm_bus_scale_client_update_request(
+			motg->bus_perf_client, vote);
+		if (ret)
+			dev_err(motg->phy.dev, "%s: Failed to vote (%d)\n"
+				   "for bus bw %d\n", __func__, vote, ret);
+	}
+}
+
 #define PHY_SUSPEND_TIMEOUT_USEC	(500 * 1000)
 #define PHY_RESUME_TIMEOUT_USEC	(100 * 1000)
 
@@ -862,6 +885,7 @@ static int msm_otg_suspend(struct msm_otg *motg)
 	struct msm_otg_platform_data *pdata = motg->pdata;
 	int cnt = 0;
 	bool host_bus_suspend, device_bus_suspend, dcp, prop_charger;
+	bool floated_charger;
 	u32 phy_ctrl_val = 0, cmd_val;
 	unsigned ret;
 	u32 portsc;
@@ -880,6 +904,7 @@ static int msm_otg_suspend(struct msm_otg *motg)
 		motg->caps & ALLOW_LPM_ON_DEV_SUSPEND;
 	dcp = motg->chg_type == USB_DCP_CHARGER;
 	prop_charger = motg->chg_type == USB_PROPRIETARY_CHARGER;
+	floated_charger = motg->chg_type == USB_FLOATED_CHARGER;
 
 	/*
 	 * Abort suspend when,
@@ -888,7 +913,8 @@ static int msm_otg_suspend(struct msm_otg *motg)
 	 */
 
 	if ((test_bit(B_SESS_VLD, &motg->inputs) && !device_bus_suspend &&
-		!dcp && !prop_charger) || test_bit(A_BUS_REQ, &motg->inputs)) {
+		!dcp && !prop_charger && !floated_charger) ||
+		test_bit(A_BUS_REQ, &motg->inputs)) {
 		enable_irq(motg->irq);
 		return -EBUSY;
 	}
@@ -1040,6 +1066,8 @@ static int msm_otg_suspend(struct msm_otg *motg)
 	if (bus)
 		clear_bit(HCD_FLAG_HW_ACCESSIBLE, &(bus_to_hcd(bus))->flags);
 
+	msm_otg_bus_vote(motg, USB_NO_PERF_VOTE);
+
 	atomic_set(&motg->in_lpm, 1);
 	/* Enable ASYNC IRQ (if present) during LPM */
 	if (motg->async_irq)
@@ -1065,8 +1093,14 @@ static int msm_otg_resume(struct msm_otg *motg)
 	if (!atomic_read(&motg->in_lpm))
 		return 0;
 
+	if (motg->pdata->delay_lpm_hndshk_on_disconnect)
+		msm_bam_notify_lpm_resume();
+
 	disable_irq(motg->irq);
 	wake_lock(&motg->wlock);
+
+	/* Some platforms require BUS vote to enable/disable clocks */
+	msm_otg_bus_vote(motg, USB_MIN_PERF_VOTE);
 
 	/* Vote for TCXO when waking up the phy */
 	if (motg->lpm_flags & XO_SHUTDOWN) {
@@ -1259,7 +1293,14 @@ static int msm_otg_notify_power_supply(struct msm_otg *motg, unsigned mA)
 		/* Set max current limit */
 		if (power_supply_set_current_limit(psy, 0))
 			goto psy_error;
+	} else {
+		if (power_supply_set_online(psy, true))
+			goto psy_error;
+		/* Current has changed (100/2 --> 500) */
+		if (power_supply_set_current_limit(psy, 1000*mA))
+			goto psy_error;
 	}
+
 	power_supply_changed(psy);
 	return 0;
 
@@ -1498,7 +1539,7 @@ static int msm_otg_set_host(struct usb_otg *otg, struct usb_bus *host)
 		vbus_otg = devm_regulator_get(motg->phy.dev, "vbus_otg");
 		if (IS_ERR(vbus_otg)) {
 			pr_err("Unable to get vbus_otg\n");
-			return -ENODEV;
+			return PTR_ERR(vbus_otg);
 		}
 	}
 
@@ -1543,7 +1584,6 @@ static int msm_otg_set_host(struct usb_otg *otg, struct usb_bus *host)
 
 static void msm_otg_start_peripheral(struct usb_otg *otg, int on)
 {
-	int ret;
 	struct msm_otg *motg = container_of(otg->phy, struct msm_otg, phy);
 	struct msm_otg_platform_data *pdata = motg->pdata;
 
@@ -1561,29 +1601,18 @@ static void msm_otg_start_peripheral(struct usb_otg *otg, int on)
 			pdata->setup_gpio(OTG_STATE_B_PERIPHERAL);
 
 		/* Configure BUS performance parameters for MAX bandwidth */
-		if (motg->bus_perf_client && debug_bus_voting_enabled) {
-			ret = msm_bus_scale_client_update_request(
-					motg->bus_perf_client, 1);
-			if (ret)
-				dev_err(motg->phy.dev, "%s: Failed to vote for "
-					   "bus bandwidth %d\n", __func__, ret);
-		}
+		if (debug_bus_voting_enabled)
+			msm_otg_bus_vote(motg, USB_MAX_PERF_VOTE);
+
 		usb_gadget_vbus_connect(otg->gadget);
 	} else {
 		dev_dbg(otg->phy->dev, "gadget off\n");
 		usb_gadget_vbus_disconnect(otg->gadget);
 		/* Configure BUS performance parameters to default */
-		if (motg->bus_perf_client) {
-			ret = msm_bus_scale_client_update_request(
-					motg->bus_perf_client, 0);
-			if (ret)
-				dev_err(motg->phy.dev, "%s: Failed to devote "
-					   "for bus bw %d\n", __func__, ret);
-		}
+		msm_otg_bus_vote(motg, USB_MIN_PERF_VOTE);
 		if (pdata->setup_gpio)
 			pdata->setup_gpio(OTG_STATE_UNDEFINED);
 	}
-
 }
 
 static int msm_otg_set_peripheral(struct usb_otg *otg,
@@ -2170,6 +2199,8 @@ static void msm_chg_block_off(struct msm_otg *motg)
 		/* Clear alt interrupt latch and enable bits */
 		ulpi_write(phy, 0x1F, 0x92);
 		ulpi_write(phy, 0x1F, 0x95);
+		/* re-enable DP and DM pull down resistors */
+		ulpi_write(phy, 0x6, 0xB);
 		break;
 	default:
 		break;
@@ -2193,6 +2224,7 @@ static const char *chg_to_string(enum usb_chg_type chg_type)
 	case USB_ACA_C_CHARGER:		return "USB_ACA_C_CHARGER";
 	case USB_ACA_DOCK_CHARGER:	return "USB_ACA_DOCK_CHARGER";
 	case USB_PROPRIETARY_CHARGER:	return "USB_PROPRIETARY_CHARGER";
+	case USB_FLOATED_CHARGER:	return "USB_FLOATED_CHARGER";
 	default:			return "INVALID_CHARGER";
 	}
 }
@@ -2206,6 +2238,7 @@ static void msm_chg_detect_work(struct work_struct *w)
 	struct msm_otg *motg = container_of(w, struct msm_otg, chg_work.work);
 	struct usb_phy *phy = &motg->phy;
 	bool is_dcd = false, tmout, vout, is_aca;
+	static bool dcd;
 	u32 line_state, dm_vlgc;
 	unsigned long delay;
 
@@ -2250,6 +2283,10 @@ static void msm_chg_detect_work(struct work_struct *w)
 		motg->dcd_time += MSM_CHG_DCD_POLL_TIME;
 		tmout = motg->dcd_time >= MSM_CHG_DCD_TIMEOUT;
 		if (is_dcd || tmout) {
+			if (is_dcd)
+				dcd = true;
+			else
+				dcd = false;
 			msm_chg_disable_dcd(motg);
 			msm_chg_enable_primary_det(motg);
 			delay = MSM_CHG_PRIMARY_DET_TIME;
@@ -2288,6 +2325,8 @@ static void msm_chg_detect_work(struct work_struct *w)
 
 			if (line_state) /* DP > VLGC or/and DM > VLGC */
 				motg->chg_type = USB_PROPRIETARY_CHARGER;
+			else if (!dcd && floated_charger_enable)
+				motg->chg_type = USB_FLOATED_CHARGER;
 			else
 				motg->chg_type = USB_SDP_CHARGER;
 
@@ -2459,6 +2498,12 @@ static void msm_otg_sm_work(struct work_struct *w)
 					ulpi_write(otg->phy, 0x2, 0x85);
 					/* fall through */
 				case USB_PROPRIETARY_CHARGER:
+					msm_otg_notify_charger(motg,
+							IDEV_CHG_MAX);
+					pm_runtime_put_noidle(otg->phy->dev);
+					pm_runtime_suspend(otg->phy->dev);
+					break;
+				case USB_FLOATED_CHARGER:
 					msm_otg_notify_charger(motg,
 							IDEV_CHG_MAX);
 					pm_runtime_put_noidle(otg->phy->dev);
@@ -3459,7 +3504,6 @@ static ssize_t msm_otg_bus_write(struct file *file, const char __user *ubuf,
 				size_t count, loff_t *ppos)
 {
 	char buf[8];
-	int ret;
 	struct seq_file *s = file->private_data;
 	struct msm_otg *motg = s->private;
 
@@ -3473,13 +3517,7 @@ static ssize_t msm_otg_bus_write(struct file *file, const char __user *ubuf,
 		debug_bus_voting_enabled = true;
 	} else {
 		debug_bus_voting_enabled = false;
-		if (motg->bus_perf_client) {
-			ret = msm_bus_scale_client_update_request(
-					motg->bus_perf_client, 0);
-			if (ret)
-				dev_err(motg->phy.dev, "%s: Failed to devote "
-					   "for bus bw %d\n", __func__, ret);
-		}
+		msm_otg_bus_vote(motg, USB_MIN_PERF_VOTE);
 	}
 
 	return count;
@@ -3854,23 +3892,36 @@ static int __init msm_otg_probe(struct platform_device *pdev)
 		pdata = pdev->dev.platform_data;
 	}
 
-	motg = kzalloc(sizeof(struct msm_otg), GFP_KERNEL);
+	motg = devm_kzalloc(&pdev->dev, sizeof(struct msm_otg), GFP_KERNEL);
 	if (!motg) {
 		dev_err(&pdev->dev, "unable to allocate msm_otg\n");
 		return -ENOMEM;
 	}
 
-	motg->phy.otg = kzalloc(sizeof(struct usb_otg), GFP_KERNEL);
+	motg->phy.otg = devm_kzalloc(&pdev->dev, sizeof(struct usb_otg),
+							GFP_KERNEL);
 	if (!motg->phy.otg) {
 		dev_err(&pdev->dev, "unable to allocate usb_otg\n");
-		ret = -ENOMEM;
-		goto free_motg;
+		return -ENOMEM;
 	}
 
 	the_msm_otg = motg;
 	motg->pdata = pdata;
 	phy = &motg->phy;
 	phy->dev = &pdev->dev;
+
+	if (motg->pdata->bus_scale_table) {
+		motg->bus_perf_client =
+		    msm_bus_scale_register_client(motg->pdata->bus_scale_table);
+		if (!motg->bus_perf_client) {
+			dev_err(motg->phy.dev, "%s: Failed to register BUS\n"
+						"scaling client!!\n", __func__);
+		} else {
+			debug_bus_voting_enabled = true;
+			/* Some platforms require BUS vote to control clocks */
+			msm_otg_bus_vote(motg, USB_MIN_PERF_VOTE);
+		}
+	}
 
 	/*
 	 * ACA ID_GND threshold range is overlapped with OTG ID_FLOAT.  Hence
@@ -3880,7 +3931,7 @@ static int __init msm_otg_probe(struct platform_device *pdev)
 	if (aca_enabled() && motg->pdata->otg_control != OTG_PMIC_CONTROL) {
 		dev_err(&pdev->dev, "ACA can not be enabled without PMIC\n");
 		ret = -EINVAL;
-		goto free_otg;
+		goto devote_bus_bw;
 	}
 
 	/* initialize reset counter */
@@ -4175,16 +4226,6 @@ static int __init msm_otg_probe(struct platform_device *pdev)
 		pm_runtime_use_autosuspend(&pdev->dev);
 	}
 
-	if (motg->pdata->bus_scale_table) {
-		motg->bus_perf_client =
-		    msm_bus_scale_register_client(motg->pdata->bus_scale_table);
-		if (!motg->bus_perf_client)
-			dev_err(motg->phy.dev, "%s: Failed to register BUS "
-						"scaling client!!\n", __func__);
-		else
-			debug_bus_voting_enabled = true;
-	}
-
 	motg->usb_psy.name = "usb";
 	motg->usb_psy.type = POWER_SUPPLY_TYPE_USB;
 	motg->usb_psy.supplied_to = otg_pm_power_supplied_to;
@@ -4252,10 +4293,12 @@ put_clk:
 		clk_put(motg->clk);
 	if (!IS_ERR(motg->phy_reset_clk))
 		clk_put(motg->phy_reset_clk);
-free_otg:
-	kfree(motg->phy.otg);
-free_motg:
-	kfree(motg);
+devote_bus_bw:
+	if (motg->bus_perf_client) {
+		msm_otg_bus_vote(motg, USB_NO_PERF_VOTE);
+		msm_bus_scale_unregister_client(motg->bus_perf_client);
+	}
+
 	return ret;
 }
 
@@ -4336,11 +4379,11 @@ static int __devexit msm_otg_remove(struct platform_device *pdev)
 		clk_put(motg->clk);
 	clk_put(motg->core_clk);
 
-	if (motg->bus_perf_client)
+	if (motg->bus_perf_client) {
+		msm_otg_bus_vote(motg, USB_NO_PERF_VOTE);
 		msm_bus_scale_unregister_client(motg->bus_perf_client);
+	}
 
-	kfree(motg->phy.otg);
-	kfree(motg);
 	return 0;
 }
 

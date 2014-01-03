@@ -83,6 +83,10 @@ static int override_phy_init;
 module_param(override_phy_init, int, S_IRUGO|S_IWUSR);
 MODULE_PARM_DESC(override_phy_init, "Override HSPHY Init Seq");
 
+static int override_phy_host_init;
+module_param(override_phy_host_init, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(override_phy_host_init, "Override HSPHY HOST Init Seq");
+
 /* Enable Proprietary charger detection */
 static bool prop_chg_detect;
 module_param(prop_chg_detect, bool, S_IRUGO | S_IWUSR);
@@ -212,6 +216,7 @@ struct dwc3_msm {
 #endif
 	int			hs_phy_irq;
 	int			hsphy_init_seq;
+	int			hsphy_host_init_seq;
 	bool			lpm_irq_seen;
 	struct delayed_work	resume_work;
 	struct work_struct	restart_usb_work;
@@ -1474,6 +1479,23 @@ static void dwc3_msm_qscratch_reg_init(struct dwc3_msm *msm)
 	dwc3_msm_ss_phy_reg_init(msm);
 }
 
+static void dwc3_msm_hsphy_host_init_seq(void)
+{
+	struct dwc3_msm *msm = context;
+
+	if (!msm) {
+		pr_err("%s: No device\n", __func__);
+		return;
+	}
+
+	if (override_phy_host_init)
+		msm->hsphy_host_init_seq = override_phy_host_init;
+	if (msm->hsphy_host_init_seq)
+		dwc3_msm_write_readback(msm->base,
+					PARAMETER_OVERRIDE_X_REG, 0x03FFFFFF,
+					msm->hsphy_host_init_seq & 0x03FFFFFF);
+}
+
 static void dwc3_msm_block_reset(bool core_reset)
 {
 
@@ -1738,7 +1760,7 @@ static void dwc3_start_ta_det(void)
 #endif
 
 #define DWC3_CHG_DCD_POLL_TIME		(100 * HZ/1000) /* 100 msec */
-#define DWC3_CHG_DCD_MAX_RETRIES	6 /* Tdcd_tmout = 6 * 100 msec */
+#define DWC3_CHG_DCD_MAX_RETRIES	100 /* Tdcd_tmout = 100 * 100 msec */
 #define DWC3_CHG_PRIMARY_DET_TIME	(50 * HZ/1000) /* TVDPSRC_ON */
 #define DWC3_CHG_SECONDARY_DET_TIME	(50 * HZ/1000) /* TVDMSRC_ON */
 
@@ -2419,9 +2441,9 @@ static enum power_supply_property dwc3_msm_pm_power_props_usb[] = {
 
 static void dwc3_init_adc_work(struct work_struct *w);
 
-static void dwc3_ext_notify_online(int on)
+static void dwc3_ext_notify_online(void *ctx, int on)
 {
-	struct dwc3_msm *mdwc = context;
+	struct dwc3_msm *mdwc = ctx;
 	bool notify_otg = false;
 
 	if (!mdwc) {
@@ -2530,13 +2552,16 @@ static void dwc3_id_work(struct work_struct *w)
 			disable_irq(mdwc->pmic_id_irq);
 
 		ret = usb_ext->notify(usb_ext->ctxt, mdwc->id_state,
-				      dwc3_ext_notify_online);
+				      dwc3_ext_notify_online, mdwc);
 		dev_dbg(mdwc->dev, "%s: external handler returned %d\n",
 			__func__, ret);
 
 		if (mdwc->pmic_id_irq) {
+			unsigned long flags;
+			local_irq_save(flags);
 			/* ID may have changed while IRQ disabled; update it */
 			mdwc->id_state = !!irq_read_line(mdwc->pmic_id_irq);
+			local_irq_restore(flags);
 			enable_irq(mdwc->pmic_id_irq);
 		}
 
@@ -2974,6 +2999,10 @@ static int __devinit dwc3_msm_probe(struct platform_device *pdev)
 	else if (!msm->hsphy_init_seq)
 		dev_warn(&pdev->dev, "incorrect hsphyinitseq.Using PORvalue\n");
 
+	if (of_property_read_u32(node, "qcom,dwc-hsphy-host-init",
+						&msm->hsphy_host_init_seq))
+		dev_dbg(&pdev->dev, "Unable to read hsphy host init seq\n");
+
 	dwc3_msm_qscratch_reg_init(msm);
 
 	pm_runtime_set_active(msm->dev);
@@ -3063,6 +3092,9 @@ static int __devinit dwc3_msm_probe(struct platform_device *pdev)
 
 		if (msm->ext_xceiv.otg_capability)
 			msm->ext_xceiv.ext_block_reset = dwc3_msm_block_reset;
+		if (msm->hsphy_host_init_seq)
+			msm->ext_xceiv.ext_hsphy_host_init_seq =
+				dwc3_msm_hsphy_host_init_seq;
 		ret = dwc3_set_ext_xceiv(msm->otg_xceiv->otg, &msm->ext_xceiv);
 		if (ret || !msm->ext_xceiv.notify_ext_events) {
 			dev_err(&pdev->dev, "failed to register xceiver: %d\n",

@@ -608,9 +608,11 @@ static void reset_config(struct usb_composite_dev *cdev)
 		bitmap_zero(f->endpoints, 32);
 	}
 	cdev->config = NULL;
+
 #if defined(CONFIG_USB_DWC3_MSM_VZW_SUPPORT)
         lge_usb_config_finish = 0;
 #endif
+	cdev->delayed_status = 0;
 }
 
 static int set_config(struct usb_composite_dev *cdev,
@@ -855,6 +857,11 @@ int usb_remove_config(struct usb_composite_dev *cdev,
 	unsigned long flags;
 
 	spin_lock_irqsave(&cdev->lock, flags);
+
+	if (WARN_ON(!config->cdev)) {
+		spin_unlock_irqrestore(&cdev->lock, flags);
+		return 0;
+	}
 
 	if (cdev->config == config)
 		reset_config(cdev);
@@ -1420,6 +1427,10 @@ static void composite_disconnect(struct usb_gadget *gadget)
 		reset_config(cdev);
 	if (composite->disconnect)
 		composite->disconnect(cdev);
+	if (cdev->delayed_status != 0) {
+		INFO(cdev, "delayed status mismatch..resetting\n");
+		cdev->delayed_status = 0;
+	}
 	spin_unlock_irqrestore(&cdev->lock, flags);
 }
 

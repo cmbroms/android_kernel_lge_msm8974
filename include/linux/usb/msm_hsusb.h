@@ -42,6 +42,20 @@
 #define MSM_VENDOR_ID			BIT(16)
 
 /**
+ * Requested USB votes for BUS bandwidth
+ *
+ * USB_NO_PERF_VOTE     BUS Vote for inactive USB session or disconnect
+ * USB_MAX_PERF_VOTE    Maximum BUS bandwidth vote
+ * USB_MIN_PERF_VOTE    Minimum BUS bandwidth vote (for some hw same as NO_PERF)
+ *
+ */
+enum usb_bus_vote {
+	USB_NO_PERF_VOTE = 0,
+	USB_MAX_PERF_VOTE,
+	USB_MIN_PERF_VOTE,
+};
+
+/**
  * Supported USB modes
  *
  * USB_PERIPHERAL       Only peripheral mode is supported.
@@ -159,6 +173,7 @@ enum usb_chg_type {
 	USB_ACA_C_CHARGER,
 	USB_ACA_DOCK_CHARGER,
 	USB_PROPRIETARY_CHARGER,
+	USB_FLOATED_CHARGER,
 };
 
 /**
@@ -456,7 +471,7 @@ struct msm_hsic_peripheral_platform_data {
 /**
  * struct usb_ext_notification: event notification structure
  * @notify: pointer to client function to call when ID event is detected.
- *          The last parameter is provided by driver to be called back when
+ *          The function parameter is provided by driver to be called back when
  *          external client indicates it is done using the USB. This function
  *          should return 0 if handled successfully, otherise an error code.
  * @ctxt: client-specific context pointer
@@ -470,17 +485,19 @@ struct msm_hsic_peripheral_platform_data {
  * called with the online parameter set to false.
  */
 struct usb_ext_notification {
-	int (*notify)(void *, int, void (*)(int online));
+	int (*notify)(void *, int, void (*)(void *, int online), void *);
 	void *ctxt;
 };
 #ifdef CONFIG_USB_BAM
 bool msm_bam_lpm_ok(void);
+void msm_bam_notify_lpm_resume(void);
 void msm_bam_set_hsic_host_dev(struct device *dev);
 void msm_bam_wait_for_hsic_prod_granted(void);
 bool msm_bam_hsic_lpm_ok(void);
 void msm_bam_hsic_notify_on_resume(void);
 #else
 static inline bool msm_bam_lpm_ok(void) { return true; }
+static inline void msm_bam_notify_lpm_resume(void) {}
 static inline void msm_bam_set_hsic_host_dev(struct device *dev) {}
 static inline void msm_bam_wait_for_hsic_prod_granted(void) {}
 static inline bool msm_bam_hsic_lpm_ok(void) { return true; }

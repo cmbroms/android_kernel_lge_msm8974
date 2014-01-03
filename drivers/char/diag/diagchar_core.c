@@ -272,6 +272,7 @@ static int diagchar_close(struct inode *inode, struct file *file)
 		 DCI_CLIENT_INDEX_INVALID)
 		diagchar_ioctl(NULL, DIAG_IOCTL_DCI_DEINIT, 0);
 	/* If the exiting process is the socket process */
+	mutex_lock(&driver->diagchar_mutex);
 	if (driver->socket_process &&
 		(driver->socket_process->tgid == current->tgid)) {
 		driver->socket_process = NULL;
@@ -280,6 +281,7 @@ static int diagchar_close(struct inode *inode, struct file *file)
 		(driver->callback_process->tgid == current->tgid)) {
 		driver->callback_process = NULL;
 	}
+	mutex_unlock(&driver->diagchar_mutex);
 
 #ifdef CONFIG_DIAG_OVER_USB
 	/* If the SD logging process exits, change logging to USB mode */
@@ -598,7 +600,7 @@ int diag_command_reg(unsigned long ioarg)
 	}
 	head_params = kzalloc(pkt_params.count*sizeof(
 		struct bindpkt_params), GFP_KERNEL);
-	if (!head_params) {
+	if (ZERO_OR_NULL_PTR(head_params)) {
 		pr_err("diag: unable to alloc memory\n");
 		return -ENOMEM;
 	} else

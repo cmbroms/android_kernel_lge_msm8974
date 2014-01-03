@@ -47,6 +47,17 @@
 #include <sound/es325-export.h>
 #endif /* CONFIG_SND_SOC_ES325_SLIM */
 
+struct sound_control {
+	int default_headphones_value;
+	int default_headset_value;
+	int default_speaker_value;
+	int default_mic_value;
+	struct snd_soc_codec *snd_control_codec;
+	bool lock;
+} soundcontrol = {
+	.lock = false,
+};
+
 #define TAIKO_MAD_SLIMBUS_TX_PORT 12
 #define TAIKO_MAD_AUDIO_FIRMWARE_PATH "wcd9320/wcd9320_mad_audio.bin"
 #define TAIKO_VALIDATE_RX_SBPORT_RANGE(port) ((port >= 16) && (port <= 22))
@@ -520,6 +531,9 @@ struct taiko_priv {
 
 	/* class h specific data */
 	struct wcd9xxx_clsh_cdc_data clsh_d;
+
+	int (*machine_codec_event_cb)(struct snd_soc_codec *codec,
+			enum wcd9xxx_codec_event);
 };
 
 static const u32 comp_shift[] = {
@@ -1061,7 +1075,7 @@ static int taiko_config_compander(struct snd_soc_dapm_widget *w,
 				    0x07, rate);
 		/* Set the static gain offset */
 		if (comp == COMPANDER_1
-			&& buck_mv == WCD9XXX_CDC_BUCK_MV_2P15) {
+			&& buck_mv == WCD9XXX_CDC_BUCK_MV_1P8) {
 			snd_soc_update_bits(codec,
 					TAIKO_A_CDC_COMP0_B4_CTL + (comp * 8),
 					0x80, 0x80);
@@ -4064,10 +4078,47 @@ static int taiko_volatile(struct snd_soc_codec *ssc, unsigned int reg)
 	return 0;
 }
 
+int reg_access(unsigned int reg)
+{
+	int ret = 1;
+
+	switch (reg) {
+		case TAIKO_A_RX_HPH_L_GAIN:
+		case TAIKO_A_RX_HPH_R_GAIN:
+		case TAIKO_A_RX_HPH_L_STATUS:
+		case TAIKO_A_RX_HPH_R_STATUS:
+		case TAIKO_A_CDC_RX1_VOL_CTL_B2_CTL:
+		case TAIKO_A_CDC_RX2_VOL_CTL_B2_CTL:
+		case TAIKO_A_CDC_RX3_VOL_CTL_B2_CTL:
+		case TAIKO_A_CDC_RX4_VOL_CTL_B2_CTL:
+		case TAIKO_A_CDC_RX5_VOL_CTL_B2_CTL:
+		case TAIKO_A_CDC_RX6_VOL_CTL_B2_CTL:
+		case TAIKO_A_CDC_RX7_VOL_CTL_B2_CTL:
+		case TAIKO_A_CDC_TX1_VOL_CTL_GAIN:
+		case TAIKO_A_CDC_TX2_VOL_CTL_GAIN:
+		case TAIKO_A_CDC_TX3_VOL_CTL_GAIN:
+		case TAIKO_A_CDC_TX4_VOL_CTL_GAIN:
+		case TAIKO_A_CDC_TX5_VOL_CTL_GAIN:
+		case TAIKO_A_CDC_TX6_VOL_CTL_GAIN:
+		case TAIKO_A_CDC_TX7_VOL_CTL_GAIN:
+		case TAIKO_A_CDC_TX8_VOL_CTL_GAIN:
+		case TAIKO_A_CDC_TX9_VOL_CTL_GAIN:
+		case TAIKO_A_CDC_TX10_VOL_CTL_GAIN:
+			if (soundcontrol.lock)
+				ret = 0;
+			break;
+		default:
+			break;
+		}
+
+	return ret;
+}
+
 static int taiko_write(struct snd_soc_codec *codec, unsigned int reg,
 	unsigned int value)
 {
 	int ret;
+	int val;
 
 	if (reg == SND_SOC_NOPM)
 		return 0;
@@ -4081,7 +4132,12 @@ static int taiko_write(struct snd_soc_codec *codec, unsigned int reg,
 				reg, ret);
 	}
 
-	return wcd9xxx_reg_write(codec->control_data, reg, value);
+	if (!reg_access(reg))
+		val = wcd9xxx_reg_read(codec->control_data, reg);
+	else
+		val = value;
+
+	return wcd9xxx_reg_write(codec->control_data, reg, val);
 }
 static unsigned int taiko_read(struct snd_soc_codec *codec,
 				unsigned int reg)
@@ -6161,6 +6217,8 @@ static void taiko_update_reg_defaults(struct snd_soc_codec *codec)
 	u32 i;
 	struct wcd9xxx *taiko_core = dev_get_drvdata(codec->dev->parent);
 
+	pr_info("Update TAIKO register defaults.\n");
+
 	for (i = 0; i < ARRAY_SIZE(taiko_reg_defaults); i++)
 		snd_soc_write(codec, taiko_reg_defaults[i].reg,
 			      taiko_reg_defaults[i].val);
@@ -6308,6 +6366,16 @@ int taiko_hs_detect(struct snd_soc_codec *codec,
 }
 EXPORT_SYMBOL_GPL(taiko_hs_detect);
 
+void taiko_event_register(
+	int (*machine_event_cb)(struct snd_soc_codec *codec,
+				enum wcd9xxx_codec_event),
+	struct snd_soc_codec *codec)
+{
+	struct taiko_priv *taiko = snd_soc_codec_get_drvdata(codec);
+	taiko->machine_codec_event_cb = machine_event_cb;
+}
+EXPORT_SYMBOL_GPL(taiko_event_register);
+
 static void taiko_init_slim_slave_cfg(struct snd_soc_codec *codec)
 {
 	struct taiko_priv *priv = snd_soc_codec_get_drvdata(codec);
@@ -6328,6 +6396,16 @@ static void taiko_init_slim_slave_cfg(struct snd_soc_codec *codec)
 	pr_debug("%s: slimbus logical address 0x%llx\n", __func__, eaddr);
 }
 
+static int taiko_device_down(struct wcd9xxx *wcd9xxx)
+{
+	struct snd_soc_codec *codec;
+
+	codec = (struct snd_soc_codec *)(wcd9xxx->ssr_priv);
+	snd_soc_card_change_online_state(codec->card, 0);
+
+	return 0;
+}
+
 static int taiko_post_reset_cb(struct wcd9xxx *wcd9xxx)
 {
 	int ret = 0;
@@ -6337,8 +6415,10 @@ static int taiko_post_reset_cb(struct wcd9xxx *wcd9xxx)
 
 	codec = (struct snd_soc_codec *)(wcd9xxx->ssr_priv);
 	taiko = snd_soc_codec_get_drvdata(codec);
-	mutex_lock(&codec->mutex);
 
+	snd_soc_card_change_online_state(codec->card, 1);
+
+	mutex_lock(&codec->mutex);
 	if (codec->reg_def_copy) {
 		pr_debug("%s: Update ASOC cache", __func__);
 		kfree(codec->reg_cache);
@@ -6346,7 +6426,6 @@ static int taiko_post_reset_cb(struct wcd9xxx *wcd9xxx)
 						codec->reg_size, GFP_KERNEL);
 	}
 
-	wcd9xxx_resmgr_post_ssr(&taiko->resmgr);
 	if (spkr_drv_wrnd == 1)
 		snd_soc_update_bits(codec, TAIKO_A_SPKR_DRV_EN, 0x80, 0x80);
 
@@ -6358,6 +6437,8 @@ static int taiko_post_reset_cb(struct wcd9xxx *wcd9xxx)
 
 	taiko_init_slim_slave_cfg(codec);
 	taiko_slim_interface_init_reg(codec);
+
+	wcd9xxx_resmgr_post_ssr(&taiko->resmgr);
 
 	if (taiko->mbhc_started) {
 		wcd9xxx_mbhc_deinit(&taiko->mbhc);
@@ -6381,6 +6462,13 @@ static int taiko_post_reset_cb(struct wcd9xxx *wcd9xxx)
 				taiko->mbhc_started = true;
 		}
 	}
+	taiko->machine_codec_event_cb(codec, WCD9XXX_CODEC_EVENT_CODEC_UP);
+
+	taiko_cleanup_irqs(taiko);
+	ret = taiko_setup_irqs(taiko);
+	if (ret)
+		pr_err("%s: Failed to setup irq: %d\n", __func__, ret);
+
 	mutex_unlock(&codec->mutex);
 	return ret;
 }
@@ -6423,9 +6511,12 @@ static struct wcd9xxx_reg_address taiko_reg_address = {
 };
 
 static int wcd9xxx_ssr_register(struct wcd9xxx *control,
-		int (*post_reset_cb)(struct wcd9xxx *wcd9xxx), void *priv)
+				int (*device_down_cb)(struct wcd9xxx *wcd9xxx),
+				int (*device_up_cb)(struct wcd9xxx *wcd9xxx),
+				void *priv)
 {
-	control->post_reset = post_reset_cb;
+	control->dev_down = device_down_cb;
+	control->post_reset = device_up_cb;
 	control->ssr_priv = priv;
 	return 0;
 }
@@ -6495,6 +6586,97 @@ static struct regulator *taiko_codec_find_regulator(struct snd_soc_codec *codec,
 	return NULL;
 }
 
+void update_headphones_volume_boost(int vol_boost)
+{
+	int default_val = soundcontrol.default_headphones_value;
+	int boosted_val = vol_boost != 0 ? 
+		default_val + vol_boost : default_val;
+
+	pr_info("Sound Control: Headphones default value %d\n", default_val);
+
+	soundcontrol.lock = false;
+	taiko_write(soundcontrol.snd_control_codec,
+		TAIKO_A_CDC_RX1_VOL_CTL_B2_CTL, boosted_val);
+	taiko_write(soundcontrol.snd_control_codec,
+		TAIKO_A_CDC_RX2_VOL_CTL_B2_CTL, boosted_val);
+	soundcontrol.lock = true;
+	
+	pr_info("Sound Control: Boosted Headphones RX1 value %d\n",
+		taiko_read(soundcontrol.snd_control_codec,
+		TAIKO_A_CDC_RX1_VOL_CTL_B2_CTL));
+
+	pr_info("Sound Control: Boosted Headphones RX2 value %d\n", 
+		taiko_read(soundcontrol.snd_control_codec, 
+		TAIKO_A_CDC_RX2_VOL_CTL_B2_CTL));
+}
+
+void update_headset_boost(int vol_boost)
+{
+	int default_val = soundcontrol.default_headset_value;
+	int boosted_val = vol_boost != 0 ? 
+		default_val + vol_boost : default_val;
+
+	pr_info("Sound Control: Headset default value %d\n", default_val);
+
+	soundcontrol.lock = false;
+	taiko_write(soundcontrol.snd_control_codec,
+		TAIKO_A_RX_HPH_R_GAIN, boosted_val);
+	taiko_write(soundcontrol.snd_control_codec,
+		TAIKO_A_RX_HPH_L_GAIN, boosted_val);
+	soundcontrol.lock = true;
+	
+	pr_info("Sound Control: Boosted Headset R value %d\n",
+		taiko_read(soundcontrol.snd_control_codec,
+		TAIKO_A_RX_HPH_R_GAIN));
+
+	pr_info("Sound Control: Boosted Headset L value %d\n", 
+		taiko_read(soundcontrol.snd_control_codec, 
+		TAIKO_A_RX_HPH_L_GAIN));
+}
+
+void update_speaker_gain(int vol_boost)
+{
+	int default_val = soundcontrol.default_speaker_value;
+	int boosted_val = vol_boost != 0 ? 
+		default_val + vol_boost : default_val;
+
+	pr_info("Sound Control: Speaker default value %d\n", default_val);
+
+	soundcontrol.lock = false;
+	taiko_write(soundcontrol.snd_control_codec,
+		TAIKO_A_CDC_RX3_VOL_CTL_B2_CTL, boosted_val);
+
+	taiko_write(soundcontrol.snd_control_codec,
+		TAIKO_A_CDC_RX7_VOL_CTL_B2_CTL, boosted_val);
+	soundcontrol.lock = true;
+	
+	pr_info("Sound Control: Boosted Speaker RX3 value %d\n",
+		taiko_read(soundcontrol.snd_control_codec,
+		TAIKO_A_CDC_RX3_VOL_CTL_B2_CTL));
+
+	pr_info("Sound Control: Boosted Speaker RX7 value %d\n",
+		taiko_read(soundcontrol.snd_control_codec,
+		TAIKO_A_CDC_RX7_VOL_CTL_B2_CTL));
+}
+
+void update_mic_gain(int vol_boost)
+{
+	int default_val = soundcontrol.default_mic_value;
+	int boosted_val = vol_boost != 0 ? 
+		default_val + vol_boost : default_val;
+
+	pr_info("Sound Control: Mic default value %d\n", default_val);
+
+	soundcontrol.lock = false;
+	taiko_write(soundcontrol.snd_control_codec,
+		TAIKO_A_CDC_TX7_VOL_CTL_GAIN, boosted_val);
+	soundcontrol.lock = true;
+	
+	pr_info("Sound Control: Boosted Mic value %d\n",
+		taiko_read(soundcontrol.snd_control_codec,
+		TAIKO_A_CDC_TX7_VOL_CTL_GAIN));
+}
+
 static int taiko_codec_probe(struct snd_soc_codec *codec)
 {
 	struct wcd9xxx *control;
@@ -6507,10 +6689,13 @@ static int taiko_codec_probe(struct snd_soc_codec *codec)
 	void *ptr = NULL;
 	struct wcd9xxx *core = dev_get_drvdata(codec->dev->parent);
 
+	soundcontrol.snd_control_codec = codec;
+
 	codec->control_data = dev_get_drvdata(codec->dev->parent);
 	control = codec->control_data;
 
-	wcd9xxx_ssr_register(control, taiko_post_reset_cb, (void *)codec);
+	wcd9xxx_ssr_register(control, taiko_device_down,
+			     taiko_post_reset_cb, (void *)codec);
 
 	dev_info(codec->dev, "%s()\n", __func__);
 
@@ -6675,11 +6860,17 @@ static int taiko_codec_probe(struct snd_soc_codec *codec)
 
 	codec->ignore_pmdown_time = 1;
 
-#ifdef CONFIG_MACH_LGE
-/* Add sysfs for SPKR_DRV_GAIN & Earjack type, jongyeol.yang, 2012-11-28 */
-	lge_taiko_codec = codec;
-	lge_taiko_mbhc = &taiko->mbhc;
-#endif
+	/*
+	 * Get the default values during probe
+	 */
+	soundcontrol.default_headphones_value = taiko_read(codec, 
+		TAIKO_A_CDC_RX1_VOL_CTL_B2_CTL);
+	soundcontrol.default_headset_value = taiko_read(codec,
+		TAIKO_A_RX_HPH_R_GAIN);
+	soundcontrol.default_speaker_value = taiko_read(codec,
+		TAIKO_A_CDC_RX3_VOL_CTL_B2_CTL);
+	soundcontrol.default_mic_value = taiko_read(codec,
+		TAIKO_A_CDC_TX7_VOL_CTL_GAIN);
 
 	return ret;
 
